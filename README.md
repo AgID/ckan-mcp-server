@@ -4,6 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Newsletter](https://img.shields.io/badge/newsletter-ondata-FF6719?logo=substack)](https://ondata.substack.com/)
 
+# CKAN MCP Server AgID
+*repo fork del progetto di OnData, sotto descritto, a servizio del Connettore MCP-CKAN su CloudFlare*
+**Link per l'endpoint MCP -> [https://ckan-mcp-server.agid.workers.dev/mcp](MCP - EndPoint AgID)**
+**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensouce**
+
 # CKAN MCP Server
 
 *Turn any (CKAN) open data portal into a conversation.*
