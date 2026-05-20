@@ -9,7 +9,7 @@
 
 **Link per l'endpoint MCP-CKAN -> [EndPoint AgID](https://ckan-mcp-server.agid.workers.dev/mcp)**
 
-**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensouce**
+**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensource di grande utilità**
 
 
 
