@@ -9,7 +9,7 @@
 
 **Link per l'endpoint MCP-CKAN per i vari Chatbot AI --> [EndPoint AgID](https://ckan-mcp-server.dati.gov.it/mcp)**
 
-**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensource di grande utilità**
+**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensource di grande utilità.**
 
 
 
