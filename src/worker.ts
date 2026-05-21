@@ -251,6 +251,36 @@ export default {
         });
       }
 
+      // CERT-AgID rec. #4 (controllo e monitoraggio): Bearer auth opzionale via env.
+      // Se CKAN_AUTH_TOKEN è settato nel Worker, ogni richiesta /mcp deve includere
+      // header 'Authorization: Bearer <token>' coincidente. Se la env non è settata
+      // (default), endpoint resta pubblico per non rompere deploy esistenti.
+      const requiredAuthToken =
+        typeof process !== 'undefined' && process.env
+          ? process.env.CKAN_AUTH_TOKEN
+          : undefined;
+      if (requiredAuthToken) {
+        const authHeader = request.headers.get('Authorization') ?? '';
+        const expected = `Bearer ${requiredAuthToken}`;
+        if (authHeader !== expected) {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32001, message: 'Unauthorized: invalid or missing Bearer token' },
+              id: null
+            }),
+            {
+              status: 401,
+              headers: {
+                'Content-Type': 'application/json',
+                'WWW-Authenticate': 'Bearer realm="ckan-mcp"',
+                'Access-Control-Allow-Origin': '*'
+              }
+            }
+          );
+        }
+      }
+
       try {
         // Create server + transport per request (stateless mode requirement)
         const server = createServer();

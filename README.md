@@ -12,8 +12,46 @@
 **Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensource di grande utilità.**
 **Consigliamo anche l'MCP ISTAT sempre sviluppato da OnData che potete trovare -->[Repo MCP ISTAT](https://github.com/ondata/istat_mcp_server)**
 
+---
 
+## Conformità CERT-AgID — paper aprile 2026
 
+Questo Worker è valutato rispetto alle 4 raccomandazioni del paper CERT-AgID
+[*LLM e Model Context Protocol: un'analisi di sicurezza*](https://www.agid.gov.it/it/notizie/llm-e-model-context-protocol-unanalisi-di-sicurezza-del-cert-agid)
+con un'avvertenza architetturale: questo è un **MCP "broker"** che, per
+definizione, esplora cataloghi CKAN/SPARQL pubblici di centinaia di
+amministrazioni della PA italiana e dell'UE. Le raccomandazioni vanno
+quindi calibrate sul caso d'uso "discovery" e non "interno chiuso".
+
+| # | Raccomandazione | Stato | Implementazione |
+|---|---|---|---|
+| 1 | **Validazione vincolante** | ✅ | Schemi `zod` su tutti gli input dei tool; check bloccante locale `SELECT/WITH`-only sul tool `ckan_datastore_search_sql` (no fallback al CKAN remoto come unica difesa); blocco di SQL multi-statement, commenti `--`/`/* */`, e parole chiave di scrittura. |
+| 2 | **Allowlist restrittive** | ⚠️ N/A pieno | Una allowlist hard-coded distruggerebbe la funzione di discovery del broker. **Mitigazioni equivalenti**: (a) SSRF strict mode bloccante — RFC1918, loopback, link-local, AWS metadata, IPv6 ULA/loopback, (b) allowlist OPZIONALE via env `CKAN_ALLOWED_DOMAINS` con supporto wildcard (es. `*.gov.it,*.europa.eu`) per deploy chiusi, (c) denylist OPZIONALE via env `CKAN_BLOCKED_DOMAINS`. |
+| 3 | **Minimo privilegio** | ✅ | Ogni tool ha scope specifico (`ckan_status_show`, `ckan_package_search`, `ckan_datastore_search`, `sparql_query`, ecc.), annotazioni MCP `readOnlyHint: true`, `destructiveHint: false`. Nessuna funzione generica/abusabile. |
+| 4 | **Controllo e monitoraggio** | ✅ | Rate limiter token-bucket per-hostname (default 5 rps, env `CKAN_RATE_LIMIT_RPS` configurabile), audit log JSON di tutte le richieste (`tool`, `server`, `q`, `sql` troncato, `cache_hit`) emesso sia su stderr (Node) sia su `console.log` (CF Workers Logs). Bearer auth opzionale via env `CKAN_AUTH_TOKEN` per deploy autenticati. |
+
+### Variabili di configurazione (Cloudflare Worker → `wrangler.toml` `[vars]` o secrets)
+
+| Variabile | Default | Uso |
+|---|---|---|
+| `CKAN_ALLOWED_DOMAINS` | _vuoto_ (open) | Lista CSV di domini (anche wildcard `*.gov.it`). Se valorizzata, blocca tutte le request verso domini fuori lista. |
+| `CKAN_BLOCKED_DOMAINS` | _vuoto_ | Lista CSV di domini sempre bloccati (valutata prima dell'allowlist). |
+| `CKAN_AUTH_TOKEN` | _vuoto_ (open) | Se valorizzata, ogni `POST /mcp` deve includere `Authorization: Bearer <token>`. |
+| `CKAN_RATE_LIMIT_ENABLED` | `true` | Spegne il rate limiter token-bucket. |
+| `CKAN_RATE_LIMIT_RPS` | `5` | Richieste/secondo per hostname upstream. |
+| `CKAN_RATE_LIMIT_BURST` | `10` | Token burst del bucket. |
+
+### Note sul caso "MCP broker"
+
+Le rec. CERT-AgID #1, #3, #4 sono pienamente applicabili e applicate.
+La rec. #2 (allowlist) è scritta per MCP "interni" che chiamano un solo
+backend controllato. Per MCP "broker" come questo l'equivalente
+funzionale è SSRF stretto + audit log + rate limit (tutti implementati).
+Per audit istituzionali AgID che richiedano allowlist hard, è
+sufficiente settare `CKAN_ALLOWED_DOMAINS` con i pattern desiderati
+nella dashboard CF dell'account AgID, senza redeploy del codice.
+
+---
 
 # CKAN MCP Server
 
