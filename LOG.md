@@ -1,5 +1,15 @@
 # LOG
 
+## 2026-05-25
+
+- Fix (scoring): `ckan_find_relevant_datasets` now scores `holder_name` (DCAT-AP_IT `dct:rightsHolder`) and `publisher_name` (`dct:publisher`) as distinct weighted fields, separate from `organization`
+- Rationale: on federated catalogs (e.g. `dati.gov.it`), `organization` is the harvesting catalog (e.g. `regione-puglia`), NOT the data owner. Queries like "datasets from Comune di Lecce" previously scored 0 on the owner field when the dataset was harvested via Regione Puglia or a GAL, missing the actual `rightsHolder`
+- Bug surfaced on real-world Puglia datasets: `defibrillatori-esterni` (holder: Comune di Mesagne, organization: GAL Terra dei Messapi) and `defibrillatori-dae-progetto-comune-cardioprotetto` (holder: Comune di Lecce, organization: Regione Puglia)
+- Defaults: `holder=4` (peer with `title` — actual institutional owner per DCAT-AP_IT), `publisher=2` (lower because sometimes a technical role like "Redazione OD" rather than the institution)
+- API: `weights` object accepts two new optional fields (`holder`, `publisher`); backward-compatible — clients not setting them get the improved scoring by default
+- Types: added `holder_name?: string` and `publisher_name?: string` to `CkanPackage` interface (previously accessed via index signature)
+- Score breakdown markdown and JSON outputs include `holder` and `publisher` per dataset
+
 ## 2026-04-22
 
 - Security: add optional domain allowlist (`CKAN_ALLOWED_DOMAINS` env var) in `validateServerUrl()`; blocks requests to unlisted public domains — CERT-AgID MCP recommendation

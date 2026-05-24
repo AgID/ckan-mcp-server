@@ -251,16 +251,52 @@ export function validateServerUrl(serverUrl: string): void {
     }
   }
 
-  // Optional domain allowlist: CKAN_ALLOWED_DOMAINS=domain1.com,domain2.org
-  const rawAllowed = typeof process !== 'undefined' ? (process.env.CKAN_ALLOWED_DOMAINS ?? '') : '';
+  // CERT-AgID rec. #2 (allowlist restrittive) — note di architettura:
+  // Questo MCP è un "broker" che esplora cataloghi CKAN/SPARQL pubblici della PA,
+  // quindi una allowlist rigida hardcoded romperebbe la funzione (i dati vivono su
+  // domini di centinaia di PA italiane). La mitigazione è:
+  //   1. SSRF protection stretta (IP privati, AWS metadata, link-local) — già fatto sopra
+  //   2. Allowlist OPZIONALE via env CKAN_ALLOWED_DOMAINS — per deploy controllati
+  //   3. Denylist OPZIONALE via env CKAN_BLOCKED_DOMAINS — per banare domini noti maligni
+  //   4. Pattern wildcard supportato: "*.gov.it" matcha "dati.gov.it", "trasparenza.regione.lombardia.gov.it"
+  //
+  // Esempio per deploy AgID: CKAN_ALLOWED_DOMAINS="*.gov.it,*.europa.eu,dati.openpolis.it"
+  const matchesPattern = (host: string, pattern: string): boolean => {
+    if (pattern.startsWith('*.')) {
+      const suffix = pattern.slice(1).toLowerCase(); // "*.gov.it" → ".gov.it"
+      return host === suffix.slice(1) || host.endsWith(suffix);
+    }
+    return host === pattern.toLowerCase();
+  };
+
+  const readEnv = (name: string): string =>
+    typeof process !== 'undefined' && process.env ? (process.env[name] ?? '') : '';
+
+  // Denylist (controllo bloccante prima dell'allowlist)
+  const rawBlocked = readEnv('CKAN_BLOCKED_DOMAINS');
+  const blockedDomains = rawBlocked.split(',').map(s => s.trim()).filter(Boolean);
+  for (const pattern of blockedDomains) {
+    if (matchesPattern(hostname, pattern)) {
+      throw new Error(`Domain "${hostname}" is explicitly blocked (CKAN_BLOCKED_DOMAINS).`);
+    }
+  }
+
+  // Allowlist (vuota = open, valorizzata = chiusa)
+  const rawAllowed = readEnv('CKAN_ALLOWED_DOMAINS');
   const allowedDomains = rawAllowed.split(',').map(s => s.trim()).filter(Boolean);
-  if (allowedDomains.length > 0 && !allowedDomains.includes(hostname)) {
-    throw new Error(`Domain "${hostname}" is not in the allowed list (CKAN_ALLOWED_DOMAINS).`);
+  if (allowedDomains.length > 0) {
+    const allowed = allowedDomains.some(pattern => matchesPattern(hostname, pattern));
+    if (!allowed) {
+      throw new Error(
+        `Domain "${hostname}" is not in the allowed list (CKAN_ALLOWED_DOMAINS).`
+      );
+    }
   }
 }
 
 function auditLog(serverUrl: string, action: string, params: Record<string, any>, cacheHit: boolean): void {
-  if (typeof process === 'undefined' || !(process as { versions?: { node?: string } }).versions?.node) return;
+  // CERT-AgID rec. #4 (monitoraggio): audit log esteso anche al runtime Worker
+  // (CF Workers con nodejs_compat + console.log = log Workers Logs dashboard).
   const entry: Record<string, unknown> = {
     ts: new Date().toISOString(),
     server: serverUrl,
@@ -273,7 +309,15 @@ function auditLog(serverUrl: string, action: string, params: Record<string, any>
   if (params.id !== undefined)   entry.id   = params.id;
   if (params.rows !== undefined) entry.rows = params.rows;
   if (params.limit !== undefined) entry.limit = params.limit;
-  try { process.stderr.write(JSON.stringify(entry) + '\n'); } catch { /* ignore */ }
+  // Node mode: scrivi su stderr (CLI logging); Worker mode: usa console.log
+  const isNode =
+    typeof process !== 'undefined' &&
+    (process as { versions?: { node?: string } }).versions?.node;
+  if (isNode) {
+    try { process.stderr.write(JSON.stringify(entry) + '\n'); } catch { /* ignore */ }
+  } else {
+    try { console.log(JSON.stringify(entry)); } catch { /* ignore */ }
+  }
 }
 
 /**

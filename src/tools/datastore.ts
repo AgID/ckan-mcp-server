@@ -8,6 +8,63 @@ import { makeCkanRequest } from "../utils/http.js";
 import { truncateText, truncateJson, addDemoFooter } from "../utils/formatting.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
+/**
+ * Validate that an SQL query is read-only (CERT-AgID compliance, raccomandazione #1:
+ * validazione vincolante, filtri bloccanti).
+ *
+ * Blocks any statement other than SELECT/WITH at the top level. Defense-in-depth: even
+ * though the CKAN DataStore API enforces read-only at server side, a local blocking
+ * filter prevents the request from leaving the MCP boundary when malformed/malicious.
+ *
+ * Rejects:
+ *   - Non-SELECT/WITH leading verb (INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/CREATE/
+ *     GRANT/REVOKE/CALL/EXECUTE)
+ *   - Multiple statements via ';' chained outside string literals
+ *   - SQL comments that could hide a second statement (-- or /* ... *\/)
+ */
+export function validateSqlReadOnly(sql: string): void {
+  const trimmed = sql.trim();
+  if (!trimmed) {
+    throw new Error("Empty SQL query is not allowed.");
+  }
+  // Reject comments (potential statement-smuggling vector)
+  if (/--/.test(trimmed) || /\/\*/.test(trimmed)) {
+    throw new Error(
+      "SQL comments (-- or /* */) are not allowed for security reasons."
+    );
+  }
+  // Detect multi-statement: any ';' not at end-of-string
+  const noTrailingSemi = trimmed.replace(/;+\s*$/, "");
+  if (noTrailingSemi.includes(";")) {
+    throw new Error(
+      "Multiple SQL statements (chained with ';') are not allowed."
+    );
+  }
+  // Verify leading keyword is SELECT or WITH (CTE)
+  const firstToken = noTrailingSemi.toUpperCase().match(/^\s*(\w+)/)?.[1];
+  if (firstToken !== "SELECT" && firstToken !== "WITH") {
+    throw new Error(
+      `Only SELECT/WITH read-only queries are allowed. Got: "${firstToken ?? "<unknown>"}".`
+    );
+  }
+  // Explicit blocklist of write keywords (defence in depth, in case parser tricked)
+  const forbiddenKeywords = [
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
+    "CREATE", "GRANT", "REVOKE", "CALL", "EXECUTE", "EXEC",
+    "REPLACE", "MERGE", "COPY", "VACUUM", "ANALYZE"
+  ];
+  const upperSql = ` ${noTrailingSemi.toUpperCase()} `;
+  for (const kw of forbiddenKeywords) {
+    // Match keyword as whole word (surrounded by non-word chars)
+    const regex = new RegExp(`\\W${kw}\\W`);
+    if (regex.test(upperSql)) {
+      throw new Error(
+        `Forbidden SQL keyword "${kw}" detected. Only read-only SELECT/WITH queries are allowed.`
+      );
+    }
+  }
+}
+
 export function formatDatastoreSearchMarkdown(
   result: { fields?: { id: string; type: string }[]; records?: Record<string, unknown>[]; total?: number },
   serverUrl: string,
@@ -259,6 +316,11 @@ Security note: SQL queries are forwarded directly to the CKAN DataStore API. The
     },
     async (params) => {
       try {
+        // CERT-AgID rec. #1: validazione bloccante locale prima di forwardare al CKAN.
+        // Difesa in profondità: anche se CKAN enforce read-only lato server, blocchiamo
+        // SQL non-SELECT direttamente al boundary MCP (no fallback).
+        validateSqlReadOnly(params.sql);
+
         const result = await makeCkanRequest<any>(
           params.server_url,
           'datastore_search_sql',
