@@ -143,6 +143,40 @@ export const scoreTextField = (text: string | undefined, terms: string[], weight
   return textMatchesTerms(text, terms) ? weight : 0;
 };
 
+/**
+ * Read a DCAT-AP_IT field (e.g. `holder_name`, `publisher_name`) from a CKAN dataset.
+ *
+ * On Italian DCAT-AP_IT portals (notably dati.gov.it via ckanext-dcatapit), `package_search`
+ * results expose DCAT fields in TWO places that often disagree:
+ *
+ *   1. Inside `extras[]` as `{ key, value }` pairs → this is the authoritative DCAT-AP_IT
+ *      source: `dct:rightsHolder` ends up under `extras[].key === "holder_name"`,
+ *      `dct:publisher` under `extras[].key === "publisher_name"`. These are the values the
+ *      data publisher set, mapped from the upstream RDF.
+ *
+ *   2. As root-level fields (`dataset.holder_name`, `dataset.publisher_name`) → on aggregator
+ *      catalogs, ckanext-dcatapit "promotes" the organization metadata into these root fields
+ *      during harvesting. For datasets harvested via a regional/GAL/Unione catalog, the root
+ *      value reflects the HARVESTER, not the data owner. Example on dati.gov.it: dataset
+ *      `defibrillatori-esterni` has `extras.holder_name = "Comune di Mesagne"` (correct) but
+ *      root `holder_name = "GAL Terra dei Messapi"` (wrong owner — that's the harvester).
+ *
+ * This helper prefers `extras[]` (DCAT-AP_IT truth) and falls back to the root field only
+ * when extras don't carry the key. The fallback is important for non-DCAT-AP_IT CKAN portals
+ * (e.g. data.gov, open.canada.ca) where root-level holder/publisher are correct.
+ */
+const readDcatExtra = (dataset: CkanPackage, key: "holder_name" | "publisher_name"): string => {
+  const extras = Array.isArray(dataset.extras) ? dataset.extras : [];
+  for (const e of extras) {
+    if (e && typeof e === "object" && (e as { key?: unknown }).key === key) {
+      const value = (e as { value?: unknown }).value;
+      if (typeof value === "string" && value.length > 0) return value;
+    }
+  }
+  const rootValue = dataset[key];
+  return typeof rootValue === "string" ? rootValue : "";
+};
+
 export const scoreDatasetRelevance = (
   query: string,
   dataset: CkanPackage,
@@ -152,8 +186,8 @@ export const scoreDatasetRelevance = (
   const titleText = dataset.title || dataset.name || "";
   const notesText = dataset.notes || "";
   const orgText = dataset.organization?.title || dataset.organization?.name || dataset.owner_org || "";
-  const holderText = typeof dataset.holder_name === "string" ? dataset.holder_name : "";
-  const publisherText = typeof dataset.publisher_name === "string" ? dataset.publisher_name : "";
+  const holderText = readDcatExtra(dataset, "holder_name");
+  const publisherText = readDcatExtra(dataset, "publisher_name");
 
   const breakdown = {
     title: scoreTextField(titleText, terms, weights.title),

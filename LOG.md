@@ -1,5 +1,14 @@
 # LOG
 
+## 2026-05-25 (v2)
+
+- Fix (scoring v2): `scoreDatasetRelevance` now reads `holder_name` and `publisher_name` from CKAN dataset `extras[]` first (authoritative DCAT-AP_IT source), with fallback to root-level fields for non-DCAT-AP_IT catalogs
+- Rationale: on dati.gov.it (ckanext-dcatapit), `package_search` returns DCAT-AP_IT fields in two locations that often disagree. Inside `extras[]` the values reflect the true `dct:rightsHolder` / `dct:publisher` set by the publisher; at root level the same field names are populated by the harvester with the harvesting organization's name, NOT the data owner
+- Concrete example: dataset `defibrillatori-esterni` on dati.gov.it has root `holder_name = "GAL Terra dei Messapi"` (the harvester) and `extras.holder_name = "Comune di Mesagne"` (the actual owner per DCAT-AP_IT). Without this fix, v1 of the scoring change still produced `holder = 0` on queries mentioning the real owner
+- The v1 fix (peer commit) introduced the holder/publisher fields but read them from the root level only; this commit completes the fix by sourcing them from the correct DCAT-AP_IT location
+- Added helper `readDcatExtra(dataset, key)` to encapsulate the lookup logic
+- Validated against real `package_search` payloads on `https://dati.gov.it/opendata`: Mesagne score 6→12, Lecce/Cardioprotetto score 10→13
+
 ## 2026-05-25
 
 - Fix (scoring): `ckan_find_relevant_datasets` now scores `holder_name` (DCAT-AP_IT `dct:rightsHolder`) and `publisher_name` (`dct:publisher`) as distinct weighted fields, separate from `organization`
