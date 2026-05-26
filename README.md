@@ -7,7 +7,7 @@
 # CKAN MCP Server AgID
 *repo fork del progetto di OnData, sotto descritto, a servizio del Connettore MCP-CKAN su CloudFlare*
 
-**Link per l'endpoint MCP-CKAN per i vari Chatbot AI --> [EndPoint AgID](https://ckan-mcp-server.dati.gov.it/mcp)**
+**Link per l'endpoint MCP-CKAN per i vari Chatbot AI --> [EndPoint AgID](https://ckan-mcp-server.agid.workers.dev/mcp)**
 
 **Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensource di grande utilità.**
 **Consigliamo anche l'MCP ISTAT sempre sviluppato da OnData che potete trovare -->[Repo MCP ISTAT](https://github.com/ondata/istat_mcp_server)**
