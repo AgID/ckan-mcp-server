@@ -5,7 +5,7 @@
 [![Newsletter](https://img.shields.io/badge/newsletter-ondata-FF6719?logo=substack)](https://ondata.substack.com/)
 
 # CKAN MCP Server AgID
-*repo fork del progetto di [OnData](https://github.com/ondata/ckan-mcp-server), sotto descritto, a servizio del Connettore MCP-CKAN su CloudFlare*
+*repo fork del progetto di **[OnData](https://github.com/ondata/ckan-mcp-server)**, sotto descritto, a servizio del Connettore MCP-CKAN su CloudFlare*
 
 **Link per l'endpoint MCP-CKAN per i vari Chatbot AI --> [EndPoint AgID](https://ckan-mcp-server.agid.workers.dev/mcp)**
 
