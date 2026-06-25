@@ -73,7 +73,7 @@ CKAN is the open-source platform behind most public open data portals worldwide 
 | **Best for** | Runs on your machine, works with any local tool | Quick start, zero setup |
 | **Limits** | None | 100k requests/day shared quota |
 
-Hosted endpoint: `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+Hosted endpoint: `https://ckan-mcp-server.agid.workers.dev/mcp`
 
 > **Recommendation**: Option B is a great way to get started and try things out without any setup. Once you're familiar with what the server can do, switching to Option A (local install) gives you unlimited usage with no shared quotas.
 
