@@ -5,12 +5,12 @@
 [![Newsletter](https://img.shields.io/badge/newsletter-ondata-FF6719?logo=substack)](https://ondata.substack.com/)
 
 # CKAN MCP Server AgID
-*repo fork del progetto di **[OnData](https://github.com/ondata/ckan-mcp-server)**, sotto descritto, a servizio del Connettore MCP-CKAN su CloudFlare*
+*repo fork del progetto di **[OnData](https://github.com/ondata/ckan-mcp-server)** a servizio del Connettore MCP-CKAN su CloudFlare*
 
 **Link per l'endpoint MCP-CKAN per i vari Chatbot AI --> [EndPoint AgID](https://ckan-mcp-server.agid.workers.dev/mcp)**
 
-**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento opensource di grande utilità.**
-**Consigliamo anche l'MCP ISTAT sempre sviluppato da OnData che potete trovare -->[Repo MCP ISTAT](https://github.com/ondata/istat_mcp_server)**
+**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento open-source di grande utilità.**
+**Consigliamo anche l'MCP ISTAT sempre sviluppato da OnData che potete trovare qui -->[Repo MCP ISTAT](https://github.com/ondata/istat_mcp_server)**
 
 ---
 
@@ -110,7 +110,7 @@ All examples below work with **both** the local installation and the hosted endp
    - Check the confirmation box, then click **Create**
 5. In a new chat, click **+** → **More** and select **CKAN MCP Server**
 
-> For a step-by-step walkthrough with screenshots, see the [full ChatGPT guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/chatgpt/chatgpt_web.md).
+> For a step-by-step walkthrough with screenshots, by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full ChatGPT guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/chatgpt/chatgpt_web.md).
 
 ### Claude Desktop
 
@@ -125,7 +125,7 @@ All examples below work with **both** the local installation and the hosted endp
 5. Open a new chat, click **+**, select **Integrations**, and enable **CKAN MCP Server**
 6. When Claude asks to use a tool, click **Allow** (or **Always allow**)
 
-> For a detailed walkthrough with screenshots, see the [full Claude guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/claude/claude_web.md).
+> For a detailed walkthrough with screenshots, , by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full Claude guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/claude/claude_web.md).
 
 **Using the hosted endpoint (no install) — via config file:**
 
@@ -190,7 +190,7 @@ claude mcp add --transport http ckan https://ckan-mcp-server.agid.workers.dev/mc
 4. Click **Connect** to save
 5. Open a new chat, click **+**, then **Connectors**, and enable **CKAN**
 
-> For a step-by-step walkthrough with screenshots, see the [full Le Chat guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/mistral/mistral_web.md).
+> For a step-by-step walkthrough with screenshots, , by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full Le Chat guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/mistral/mistral_web.md).
 
 ### Perplexity Pro
 
@@ -206,7 +206,7 @@ claude mcp add --transport http ckan https://ckan-mcp-server.agid.workers.dev/mc
 4. Check the confirmation box and click **Save**
 5. In a new chat, click **+** → **Connectors & sources** and enable **ckan_mcp_server**
 
-> For a step-by-step walkthrough with screenshots, see the [full Perplexity guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/perplexity/perplexity.md).
+> For a step-by-step walkthrough with screenshots, , by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full Perplexity guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/perplexity/perplexity.md).
 
 ### Gemini CLI
 
