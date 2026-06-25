@@ -105,7 +105,7 @@ All examples below work with **both** the local installation and the hosted endp
 4. Fill in the form:
    - **Name:** CKAN MCP Server
    - **Description:** Search datasets on CKAN open data portals
-   - **MCP Server URL:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **MCP Server URL:** `https://ckan-mcp-server.agid.workers.dev/mcp`
    - **Authentication:** No Auth
    - Check the confirmation box, then click **Create**
 5. In a new chat, click **+** → **More** and select **CKAN MCP Server**
@@ -120,7 +120,7 @@ All examples below work with **both** the local installation and the hosted endp
 2. Click **Add custom integration**
 3. Fill in the details:
    - **Name:** CKAN MCP Server
-   - **MCP Server URL:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **MCP Server URL:** `https://ckan-mcp-server.agid.workers.dev/mcp`
 4. Click **Add** to save
 5. Open a new chat, click **+**, select **Integrations**, and enable **CKAN MCP Server**
 6. When Claude asks to use a tool, click **Allow** (or **Always allow**)
@@ -139,7 +139,7 @@ Configuration file location:
 {
   "mcpServers": {
     "ckan": {
-      "url": "https://ckan-mcp-server.andy-pr.workers.dev/mcp"
+      "url": "https://ckan-mcp-server.agid.workers.dev/mcp"
     }
   }
 }
@@ -163,7 +163,7 @@ Configuration file location:
 **Using the hosted endpoint (no install):**
 
 ```bash
-claude mcp add -s user -t http ckan https://ckan-mcp-server.andy-pr.workers.dev/mcp
+claude mcp add -s user -t http ckan https://ckan-mcp-server.agid.workers.dev/mcp
 ```
 
 **Using local installation:**
@@ -177,7 +177,7 @@ claude mcp add -s user ckan npx @aborruso/ckan-mcp-server@latest
 To add it only for a specific project, run from the project folder without the `--scope user` flag:
 
 ```bash
-claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev/mcp
+claude mcp add --transport http ckan https://ckan-mcp-server.agid.workers.dev/mcp
 ```
 
 ### Le Chat (Mistral)
@@ -186,7 +186,7 @@ claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev
 2. Click **+ Add Connector**
 3. Select the **Custom MCP Connector** tab and fill in the details:
    - **Name:** CKAN
-   - **Connector Server:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **Connector Server:** `https://ckan-mcp-server.agid.workers.dev/mcp`
 4. Click **Connect** to save
 5. Open a new chat, click **+**, then **Connectors**, and enable **CKAN**
 
@@ -200,7 +200,7 @@ claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev
 2. Click **Connect external app**
 3. Fill in the details:
    - **Name:** CKAN MCP Server
-   - **MCP Server URL:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **MCP Server URL:** `https://ckan-mcp-server.agid.workers.dev/mcp`
    - **Authorization Type:** No Authentication
    - **Connection Type:** HTTP Streamable
 4. Check the confirmation box and click **Save**
@@ -211,7 +211,7 @@ claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev
 ### Gemini CLI
 
 ```bash
-gemini mcp add -s user -t http ckan https://ckan-mcp-server.andy-pr.workers.dev/mcp
+gemini mcp add -s user -t http ckan https://ckan-mcp-server.agid.workers.dev/mcp
 ```
 
 Or add manually to `~/.gemini/settings.json`:
@@ -220,7 +220,7 @@ Or add manually to `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "ckan": {
-      "httpUrl": "https://ckan-mcp-server.andy-pr.workers.dev/mcp"
+      "httpUrl": "https://ckan-mcp-server.agid.workers.dev/mcp"
     }
   }
 }
@@ -236,7 +236,7 @@ Add to your User Settings or `.vscode/settings.json`:
 {
   "mcpServers": {
     "ckan": {
-      "url": "https://ckan-mcp-server.andy-pr.workers.dev/mcp",
+      "url": "https://ckan-mcp-server.agid.workers.dev/mcp",
       "type": "http"
     }
   }
@@ -264,7 +264,7 @@ Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.ckan]
-url = "https://ckan-mcp-server.andy-pr.workers.dev/mcp"
+url = "https://ckan-mcp-server.agid.workers.dev/mcp"
 ```
 
 **Using local installation:**
