@@ -1,5 +1,15 @@
 # LOG
 
+## 2026-09-24
+
+### `ckan_package_show`: temporal coverage (dct:temporal)
+
+New `readTemporalCoverage()` reads `dct:temporal` in both shapes dati.gov.it uses: root `temporal_coverage` (JSON string, e.g. Comune di Coriano) and extras `temporal_start`/`temporal_end`/`temporal_coverage` (Regione Toscana, 12,426 datasets). Rendered as **Temporal Coverage (dct:temporal)** in markdown and `temporal_coverage: [{start, end, start_equals_issued}]` in JSON, every period kept; before, JSON had nothing and markdown only the extras case. `start_equals_issued` is a factual flag for start = issued with no end: a full scan of the 17,860 datasets with `temporal_start` found a third like that, and on the origin portals (dati.toscana.it, opendata.maggioli.cloud, opendata.uniba.it, all dcatapit) `temporal_coverage` is empty in the CKAN API while their RDF export emits `dct:temporal` with `startDate` = `dct:issued`. So it is an export artefact, not a publisher entry. INPS, MIT, LaMMA weather runs and Camera di Commercio Marche carry real spans.
+
+### server.json: declare `CKAN_ALLOWED_DOMAINS` as optional
+
+Claude Desktop's configure dialog asked for six env vars, `CKAN_ALLOWED_DOMAINS` marked required, inferred from the README HTTP table. The registry package is stdio, where the allowlist is optional. `server.json` now declares the one variable explicitly (`isRequired: false`, placeholder). Takes effect on the next registry publish.
+
 ## 2026-09-23
 
 ### v0.4.126 - why MQA URL tests fail

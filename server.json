@@ -14,7 +14,15 @@
       "version": "0.4.126",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "CKAN_ALLOWED_DOMAINS",
+          "description": "Comma-separated CKAN hostnames to allow. Empty = any portal.",
+          "isRequired": false,
+          "placeholder": "www.dati.gov.it,open.canada.ca"
+        }
+      ]
     }
   ]
 }
