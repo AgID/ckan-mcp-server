@@ -4,11 +4,11 @@
 
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema, CkanTag, CkanResource, CkanPackage } from "../types.js";
-import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, truncateJson, formatDate, formatBytes, addDemoFooter } from "../utils/formatting.js";
-import { getDatasetViewUrl } from "../utils/url-generator.js";
-import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery } from "../utils/search.js";
-import { getPortalHvdConfig, getPortalApiPath, requiresMultilingualNormalization, isPortalSearchExplicitlyConfigured } from "../utils/portal-config.js";
+import { makeCkanRequest, formatCkanError } from "../utils/http.js";
+import { truncateText, truncateJson, formatDate, formatBytes, addDemoFooter, wrapUntrusted, safeUrlText, formatError, jsonToolResult, sanitizeInline } from "../utils/formatting.js";
+import { getDatasetViewUrl, extractSourcePortal } from "../utils/url-generator.js";
+import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery, mayNeedTextWrapping, hasExplicitBooleanOperator } from "../utils/search.js";
+import { getPortalHvdConfig, getPortalApiPath, requiresMultilingualNormalization } from "../utils/portal-config.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 /**
@@ -18,31 +18,131 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
  */
 const _portalParserCache = new Map<string, boolean>();
 
+/** Terms safe to drop into a probe query verbatim: no Solr syntax. */
+const LITERAL_TERM = /^[\p{L}\p{N}_]+$/u;
+
 /**
- * Probe a portal to detect whether it needs force_text_field.
- * Runs two parallel rows=0 queries (default vs text parser) using "data OR dati".
- * If text count > default count * 2, the portal has the Solr df bug and needs wrapping.
- * Result is cached for the session lifetime.
+ * Pick two terms that actually occur in this catalog, for the parser probe below.
+ *
+ * They must be single words (a multi-word term would need quoting and change the
+ * parse) and neither rare nor saturating: a term matching most of the catalog makes
+ * `A OR B` indistinguishable from `A`, which is how the previous probe — hardcoded to
+ * "data OR dati" — read dati.comune.milano.it as healthy while `aria OR acqua` there
+ * returned 0 against 54 and 33 for the single terms.
+ *
+ * Tag facets first, since tags are in the catalog's own language; frequent title words
+ * as a fallback for portals that expose no tag facets (open.canada.ca) or too few
+ * (dati.regione.sicilia.it).
+ */
+async function pickProbeTerms(serverUrl: string): Promise<[string, string] | null> {
+  const facetRes = await makeCkanRequest<any>(serverUrl, 'package_search', {
+    q: '*:*',
+    rows: 0,
+    'facet.field': '["tags"]',
+    'facet.limit': 100
+  }).catch(() => null);
+
+  const total: number = facetRes?.count ?? 0;
+  if (!total) return null;
+
+  const items: Array<{ name?: string; count?: number }> =
+    facetRes?.search_facets?.tags?.items ?? [];
+  const usable = items
+    // Letters, digits and underscore only: a tag like `open-data` or one carrying a
+    // colon would be read as Solr syntax and skew the very query that measures the
+    // parser. Unescaped is the point — the probe must look like an ordinary search.
+    .filter(i => typeof i.name === 'string' && LITERAL_TERM.test(i.name))
+    .filter(i => (i.count ?? 0) >= total * 0.005 && (i.count ?? 0) <= total * 0.3)
+    .sort((a, b) => (b.count ?? 0) - (a.count ?? 0));
+  if (usable.length >= 2) return [usable[0].name!, usable[1].name!];
+
+  const sampleRes = await makeCkanRequest<any>(serverUrl, 'package_search', {
+    q: '*:*',
+    rows: 25
+  }).catch(() => null);
+  const titles: string[] = (sampleRes?.results ?? []).map((r: any) => r?.title ?? '');
+  const words = titles.map(t => new Set(t.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(w => w.length > 4)));
+  const freq = new Map<string, number>();
+  for (const set of words) for (const w of set) freq.set(w, (freq.get(w) ?? 0) + 1);
+
+  const ranked = [...freq.entries()]
+    .filter(([w]) => LITERAL_TERM.test(w))
+    .sort((a, b) => b[1] - a[1]);
+  const first = ranked[0]?.[0];
+  if (!first) return null;
+
+  // The second term must not be a synonym of the first: if the two always occur in
+  // the same titles, `A OR B` equals `A` even when the portal honours OR, and the
+  // probe would cache a false negative. Prefer the most frequent word that appears
+  // somewhere the first one does not.
+  const independent = ranked
+    .slice(1)
+    .find(([w]) => words.some(set => set.has(w) && !set.has(first)));
+  const second = independent?.[0] ?? ranked[1]?.[0];
+  return second ? [first, second] : null;
+}
+
+/**
+ * Does this portal need `text:(...)` wrapping to honour a boolean query?
+ *
+ * `package_search` hands a colon-free query to Solr's dismax parser with `q.op=AND`
+ * (ckan/lib/search/query.py), and dismax has no boolean syntax: `A OR B` collapses to
+ * `A AND B`. A colon takes the query off dismax, which is what the wrapper exploits.
+ * That is CKAN's own default, so most portals need it — but not all: on
+ * data.stadt-zuerich.ch the catch-all `text` field returns 0 for every query, and
+ * wrapping there loses everything.
+ *
+ * So: an `A OR B` that returns fewer hits than `A` or `B` alone is not being honoured,
+ * and the wrapper is the fix only if the wrapped form actually returns more.
+ * Four rows=0 counts, cached per portal for the session, negative verdicts included.
+ * Callers must only reach here for queries that carry a boolean operator — nothing
+ * else is ever wrapped, so nothing else needs to pay for this.
  */
 async function probePortalParser(serverUrl: string): Promise<boolean> {
   const key = serverUrl.replace(/\/$/, '').toLowerCase();
   if (_portalParserCache.has(key)) return _portalParserCache.get(key)!;
 
-  const probe = 'data OR dati';
-  const [defaultRes, textRes] = await Promise.allSettled([
-    makeCkanRequest<any>(serverUrl, 'package_search', { q: probe, rows: 0 }),
-    makeCkanRequest<any>(serverUrl, 'package_search', { q: `text:(${probe})`, rows: 0 })
-  ]);
+  const terms = await pickProbeTerms(serverUrl).catch(() => null);
+  if (!terms) return false;   // could not measure: do not wrap, and do not remember
 
-  const defaultCount = defaultRes.status === 'fulfilled' ? (defaultRes.value.count ?? 0) : 0;
-  const textCount = textRes.status === 'fulfilled' ? (textRes.value.count ?? 0) : 0;
+  let needsText = false;
+  let measured = false;
+  {
+    const [a, b] = terms;
+    const count = async (q: string): Promise<number | null> => {
+      const res = await makeCkanRequest<any>(serverUrl, 'package_search', { q, rows: 0 })
+        .catch(() => null);
+      return typeof res?.count === 'number' ? res.count : null;
+    };
+    const [ca, cb, cOr, cText] = await Promise.all([
+      count(a),
+      count(b),
+      count(`${a} OR ${b}`),
+      count(`text:(${a} OR ${b})`)
+    ]);
 
-  const needsText = textCount > 0 && (defaultCount === 0 || textCount > defaultCount * 2);
-  _portalParserCache.set(key, needsText);
+    if (ca !== null && cb !== null && cOr !== null && cText !== null) {
+      const booleanIgnored = cOr < Math.max(ca, cb);
+      needsText = booleanIgnored && cText > cOr;
+      measured = true;
+    }
+  }
+
+  // A portal that timed out or errored must not be written off for the whole
+  // session: an unmeasured verdict is never cached, so the next boolean query on
+  // that portal tries again.
+  if (measured) _portalParserCache.set(key, needsText);
   return needsText;
 }
 
 type RelevanceWeights = {
+  /**
+   * Bonus for a dataset the portal itself returned with every query term required
+   * (`mm=100%`). Solr matches with its own stemming across `qf`, so this is the one
+   * signal the local matcher cannot fake — and the reason the right dataset now leads
+   * with a margin instead of tying on Solr's order.
+   */
+  coverage: number;
   title: number;
   notes: number;
   tags: number;
@@ -63,6 +163,7 @@ type RelevanceWeights = {
 };
 
 type RelevanceBreakdown = {
+  coverage: number;
   title: number;
   notes: number;
   tags: number;
@@ -73,6 +174,7 @@ type RelevanceBreakdown = {
 };
 
 const DEFAULT_RELEVANCE_WEIGHTS: RelevanceWeights = {
+  coverage: 4,
   title: 4,
   notes: 2,
   tags: 3,
@@ -82,6 +184,14 @@ const DEFAULT_RELEVANCE_WEIGHTS: RelevanceWeights = {
 };
 
 const QUERY_STOPWORDS = new Set([
+  // Italian: without these, `defibrillatori Comune di Lecce` scored a full holder
+  // match against "Provincia Autonoma di Trento" on the strength of "di" alone.
+  "di", "del", "dello", "della", "dei", "degli", "delle",
+  // elided forms: `dell'aria` tokenises to `dell` + `aria`
+  "dell", "nell", "dall", "sull", "all", "coll", "quell",
+  "il", "lo", "la", "i", "gli", "le", "un", "uno", "una",
+  "e", "ed", "per", "con", "su", "da", "dal", "dalla", "nel", "nella", "al", "alla",
+  "che", "non", "come", "dove", "sono",
   "a",
   "an",
   "the",
@@ -125,22 +235,77 @@ const QUERY_STOPWORDS = new Set([
   "those"
 ]);
 
+/** Solr boolean keywords: all-caps by convention, never a term to score on. */
+const SOLR_OPERATORS = new Set(["AND", "OR", "NOT"]);
+
 export const extractQueryTerms = (query: string): string[] => {
-  const matches = query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
-  const terms = matches.filter((term) => term.length > 1 && !QUERY_STOPWORDS.has(term));
+  const normalized = query.normalize("NFC");
+  const raw = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
+  // Inside double quotes Solr reads a keyword as a literal, so `"OR"` is a term to
+  // score on while a bare `OR` is syntax. Tokenisation has already dropped the quotes,
+  // so the quoted tokens are collected first.
+  const quoted = new Set<string>();
+  // `\"` inside a phrase is a literal quote, not the end of it: `"OR\" AND"` is one phrase.
+  for (const m of normalized.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    for (const t of m[1].match(/[\p{L}\p{N}]+/gu) ?? []) quoted.add(t);
+  }
+  // An all-caps token is an acronym, not an article: the stopword list is there for
+  // `defibrillatori Comune di Lecce`, and must not swallow the `UN` of `UN population`
+  // on a catalog in another language. Solr's own operators are the exception to the
+  // exception — `aria OR acqua` is a query, not a mention of an organisation called OR.
+  const terms = raw
+    .filter((token) => {
+      if (SOLR_OPERATORS.has(token) && !quoted.has(token)) return false;
+      const term = token.toLowerCase();
+      if (term.length <= 1) return false;
+      if (!QUERY_STOPWORDS.has(term)) return true;
+      return token.length > 1 && token === token.toUpperCase() && token !== term;
+    })
+    .map((token) => token.toLowerCase());
   return Array.from(new Set(terms));
 };
 
 export const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-export const textMatchesTerms = (text: string | undefined, terms: string[]): boolean => {
-  if (!text || terms.length === 0) return false;
-  const normalized = text.toLowerCase().replace(/_/g, " ");
-  return terms.some((term) => new RegExp(`\\b${escapeRegExp(term)}\\b`, "i").test(normalized));
+/**
+ * A term matches a word when they are equal, or when they share a stem: the final
+ * vowel stripped from words of five letters or more. `defibrillatori` in the query and
+ * `defibrillatore` in a tag were strangers to the old whole-word regex, and the one
+ * dataset actually about defibrillators lost its tag score to datasets about patrocini.
+ * Whole-word comparison keeps the boundary: `immobilità` still does not match
+ * `mobilità`. Accented vowels count, so `qualità` and the slug `qualita` share a stem.
+ */
+const FINAL_VOWEL = /[aeiouàèéìòù]$/u;
+export const stemTerm = (word: string): string =>
+  word.length >= 5 ? word.replace(FINAL_VOWEL, "") : word;
+
+const wordsOf = (text: string): string[] =>
+  text.normalize("NFC").toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+
+const termMatchesWord = (term: string, word: string): boolean =>
+  word === term || (term.length >= 5 && word.length >= 5 && stemTerm(word) === stemTerm(term));
+
+export const textMatchesTerms = (text: string | undefined, terms: string[]): boolean =>
+  countMatchingTerms(text, terms) > 0;
+
+/** How many of the query's terms this text contains. */
+export const countMatchingTerms = (text: string | undefined, terms: string[]): number => {
+  if (!text || terms.length === 0) return 0;
+  const words = wordsOf(text);
+  return terms.filter((term) => words.some((word) => termMatchesWord(term.normalize("NFC"), word))).length;
 };
 
+/**
+ * Score a field by the share of query terms it carries, not by whether any of them
+ * appears. With the all-or-nothing rule a single common word earned the whole field:
+ * on `defibrillatori Comune di Lecce`, "Comune di Martina Franca" and "Comune di Lecce"
+ * both scored a full holder match, so the catalog's only Lecce dataset could not
+ * outrank the others and fell out of the top results.
+ */
 export const scoreTextField = (text: string | undefined, terms: string[], weight: number): number => {
-  return textMatchesTerms(text, terms) ? weight : 0;
+  const matched = countMatchingTerms(text, terms);
+  if (matched === 0) return 0;
+  return Math.round((weight * matched / terms.length) * 10) / 10;
 };
 
 /**
@@ -165,7 +330,7 @@ export const scoreTextField = (text: string | undefined, terms: string[], weight
  * when extras don't carry the key. The fallback is important for non-DCAT-AP_IT CKAN portals
  * (e.g. data.gov, open.canada.ca) where root-level holder/publisher are correct.
  */
-const readDcatExtra = (dataset: CkanPackage, key: "holder_name" | "publisher_name"): string => {
+export const readDcatExtra = (dataset: CkanPackage, key: "holder_name" | "publisher_name"): string => {
   const extras = Array.isArray(dataset.extras) ? dataset.extras : [];
   for (const e of extras) {
     if (e && typeof e === "object" && (e as { key?: unknown }).key === key) {
@@ -177,10 +342,67 @@ const readDcatExtra = (dataset: CkanPackage, key: "holder_name" | "publisher_nam
   return typeof rootValue === "string" ? rootValue : "";
 };
 
+export interface TemporalCoverage {
+  start: string | null;
+  end: string | null;
+}
+
+const readExtra = (dataset: CkanPackage, key: string): unknown => {
+  const extras = Array.isArray(dataset.extras) ? dataset.extras : [];
+  for (const e of extras) {
+    if (e && typeof e === "object" && (e as { key?: unknown }).key === key) {
+      return (e as { value?: unknown }).value;
+    }
+  }
+  return undefined;
+};
+
+const toPeriod = (item: unknown): TemporalCoverage | null => {
+  if (!item || typeof item !== "object") return null;
+  const { temporal_start, temporal_end } = item as { temporal_start?: unknown; temporal_end?: unknown };
+  const start = typeof temporal_start === "string" && temporal_start ? temporal_start : null;
+  const end = typeof temporal_end === "string" && temporal_end ? temporal_end : null;
+  return start || end ? { start, end } : null;
+};
+
+const parseTemporalCoverage = (raw: unknown): TemporalCoverage[] => {
+  let value = raw;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return []; }
+  }
+  const items = Array.isArray(value) ? value : [value];
+  return items.map(toPeriod).filter((p): p is TemporalCoverage => p !== null);
+};
+
+/**
+ * dct:temporal periods as exposed by ckanext-dcat, in the shapes seen on dati.gov.it:
+ * root `temporal_coverage` (JSON string or array of {temporal_start, temporal_end}),
+ * or the same under extras, or flat extras `temporal_start` / `temporal_end`.
+ * Returns every period the portal lists; empty when none.
+ */
+export const readTemporalCoverage = (dataset: CkanPackage): TemporalCoverage[] => {
+  const fromRoot = parseTemporalCoverage(dataset.temporal_coverage);
+  if (fromRoot.length > 0) return fromRoot;
+  const fromExtra = parseTemporalCoverage(readExtra(dataset, "temporal_coverage"));
+  if (fromExtra.length > 0) return fromExtra;
+  return parseTemporalCoverage({ temporal_start: readExtra(dataset, "temporal_start"), temporal_end: readExtra(dataset, "temporal_end") });
+};
+
+/**
+ * True when the period starts on the dataset's issued date and has no end.
+ * A factual check, exposed as-is: on dcatapit portals this shape is an export
+ * default (dct:temporal emitted with startDate = dct:issued when the publisher
+ * left coverage empty), so a third of dati.gov.it datasets with temporal_start
+ * carry a publish date rather than a data period. Other portals may mean it.
+ */
+export const startEqualsIssued = (period: TemporalCoverage, issued: unknown): boolean =>
+  period.end === null && typeof issued === "string" && period.start !== null && period.start.slice(0, 10) === issued.slice(0, 10);
+
 export const scoreDatasetRelevance = (
   query: string,
   dataset: CkanPackage,
-  weights: RelevanceWeights = DEFAULT_RELEVANCE_WEIGHTS
+  weights: RelevanceWeights = DEFAULT_RELEVANCE_WEIGHTS,
+  fullCoverage = false
 ): { total: number; breakdown: RelevanceBreakdown; terms: string[] } => {
   const terms = extractQueryTerms(query);
   const titleText = dataset.title || dataset.name || "";
@@ -190,6 +412,7 @@ export const scoreDatasetRelevance = (
   const publisherText = readDcatExtra(dataset, "publisher_name");
 
   const breakdown = {
+    coverage: fullCoverage ? weights.coverage : 0,
     title: scoreTextField(titleText, terms, weights.title),
     notes: scoreTextField(notesText, terms, weights.notes),
     tags: 0,
@@ -207,13 +430,17 @@ export const scoreDatasetRelevance = (
     breakdown.tags = tagMatch ? weights.tags : 0;
   }
 
-  breakdown.total =
-    breakdown.title +
-    breakdown.notes +
-    breakdown.tags +
-    breakdown.organization +
-    breakdown.holder +
-    breakdown.publisher;
+  // Rounded: the per-field shares are fractions, and summing them raw surfaces
+  // binary-float noise in the output — a score printed as 8.299999999999999.
+  breakdown.total = Math.round(
+    (breakdown.coverage +
+      breakdown.title +
+      breakdown.notes +
+      breakdown.tags +
+      breakdown.organization +
+      breakdown.holder +
+      breakdown.publisher) * 10
+  ) / 10;
 
   return { total: breakdown.total, breakdown, terms };
 };
@@ -275,20 +502,20 @@ export const enrichPackageShowResult = (result: CkanPackage): CkanPackage => ({
 });
 
 export const formatPackageShowMarkdown = (result: CkanPackage, serverUrl: string): string => {
-  let markdown = `# Dataset: ${result.title || result.name}\n\n`;
+  let markdown = `# Dataset: ${sanitizeInline(result.title || result.name)}\n\n`;
   markdown += `**Server**: ${serverUrl}\n`;
   markdown += `**Link**: ${getDatasetViewUrl(serverUrl, result)}\n`;
-  markdown += `**Full JSON metadata**: ${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/package_show?id=${result.id}\n\n`;
+  markdown += `**Full JSON metadata**: ${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/package_show?id=${encodeURIComponent(result.id)}\n\n`;
 
   markdown += `## Basic Information\n\n`;
-  markdown += `- **ID**: \`${result.id}\`\n`;
-  markdown += `- **Name**: \`${result.name}\`\n`;
-  if (result.author) markdown += `- **Author**: ${result.author}\n`;
-  if (result.author_email) markdown += `- **Author Email**: ${result.author_email}\n`;
-  if (result.maintainer) markdown += `- **Maintainer**: ${result.maintainer}\n`;
-  if (result.maintainer_email) markdown += `- **Maintainer Email**: ${result.maintainer_email}\n`;
-  markdown += `- **License**: ${result.license_title || result.license_id || 'Not specified'}\n`;
-  markdown += `- **State**: ${result.state}\n`;
+  markdown += `- **ID**: \`${sanitizeInline(result.id)}\`\n`;
+  markdown += `- **Name**: \`${sanitizeInline(result.name)}\`\n`;
+  if (result.author) markdown += `- **Author**: ${sanitizeInline(result.author)}\n`;
+  if (result.author_email) markdown += `- **Author Email**: ${sanitizeInline(result.author_email)}\n`;
+  if (result.maintainer) markdown += `- **Maintainer**: ${sanitizeInline(result.maintainer)}\n`;
+  if (result.maintainer_email) markdown += `- **Maintainer Email**: ${sanitizeInline(result.maintainer_email)}\n`;
+  markdown += `- **License**: ${sanitizeInline(result.license_title || result.license_id || 'Not specified')}\n`;
+  markdown += `- **State**: ${sanitizeInline(result.state)}\n`;
   markdown += `- **Created**: ${formatDate(result.metadata_created)}\n`;
   if (result.issued) {
     markdown += `- **Issued**: ${formatDate(result.issued)}\n`;
@@ -296,27 +523,51 @@ export const formatPackageShowMarkdown = (result: CkanPackage, serverUrl: string
     markdown += `- **Issued**: (missing in CKAN; downstream RDF may default to metadata_created, which is a record timestamp)\n`;
   }
   if (result.modified) markdown += `- **Modified (Content)**: ${formatDate(result.modified)}\n`;
-  markdown += `- **Metadata Modified (Record)**: ${formatDate(result.metadata_modified)}\n\n`;
+  markdown += `- **Metadata Modified (Record)**: ${formatDate(result.metadata_modified)}\n`;
+
+  // DCAT-AP fields returned natively by package_show but not otherwise surfaced.
+  // holder/publisher via readDcatExtra (extras override root on aggregators); the rest read root.
+  const holderName = readDcatExtra(result, "holder_name");
+  if (holderName) markdown += `- **Rights Holder (dct:rightsHolder)**: ${sanitizeInline(holderName)}\n`;
+  const publisherName = readDcatExtra(result, "publisher_name");
+  if (publisherName) markdown += `- **Publisher (dct:publisher)**: ${sanitizeInline(publisherName)}\n`;
+  const dcatField = (key: string): string =>
+    typeof result[key] === "string" ? (result[key] as string) : "";
+  const frequency = dcatField("frequency");
+  if (frequency) markdown += `- **Update Frequency (dct:accrualPeriodicity)**: ${sanitizeInline(frequency)}\n`;
+  const language = dcatField("language");
+  if (language) markdown += `- **Language (dct:language)**: ${sanitizeInline(language)}\n`;
+  const accessRights = dcatField("access_rights");
+  if (accessRights) markdown += `- **Access Rights (dct:accessRights)**: ${sanitizeInline(accessRights)}\n`;
+  const periods = readTemporalCoverage(result);
+  if (periods.length > 0) {
+    const spans = periods.map((p) => {
+      const span = `${p.start ? formatDate(p.start) : "?"} → ${p.end ? formatDate(p.end) : "open"}`;
+      return startEqualsIssued(p, result.issued) ? `${span} (start equals issued, no end)` : span;
+    });
+    markdown += `- **Temporal Coverage (dct:temporal)**: ${sanitizeInline(spans.join("; "))}\n`;
+  }
+  markdown += `\n`;
 
   if (result.organization) {
     markdown += `## Organization\n\n`;
-    markdown += `- **Name**: ${result.organization.title || result.organization.name}\n`;
-    markdown += `- **ID**: \`${result.organization.id}\`\n\n`;
+    markdown += `- **Name**: ${sanitizeInline(result.organization.title || result.organization.name)}\n`;
+    markdown += `- **ID**: \`${sanitizeInline(result.organization.id)}\`\n\n`;
   }
 
   if (result.notes) {
-    markdown += `## Description\n\n${result.notes}\n\n`;
+    markdown += `## Description\n\n${wrapUntrusted(result.notes)}\n\n`;
   }
 
   if (result.tags && result.tags.length > 0) {
     markdown += `## Tags\n\n`;
-    markdown += result.tags.map((t: CkanTag) => `- ${t.name}`).join('\n') + '\n\n';
+    markdown += result.tags.map((t: CkanTag) => `- ${sanitizeInline(t.name)}`).join('\n') + '\n\n';
   }
 
   if (result.groups && result.groups.length > 0) {
     markdown += `## Groups\n\n`;
     for (const group of result.groups) {
-      markdown += `- **${group.title || group.name}** (\`${group.name}\`)\n`;
+      markdown += `- **${sanitizeInline(group.title || group.name)}** (\`${sanitizeInline(group.name)}\`)\n`;
     }
     markdown += '\n';
   }
@@ -324,11 +575,11 @@ export const formatPackageShowMarkdown = (result: CkanPackage, serverUrl: string
   if (result.resources && result.resources.length > 0) {
     markdown += `## Resources (${result.resources.length})\n\n`;
     for (const resource of result.resources) {
-      markdown += `### ${resource.name || 'Unnamed Resource'}\n\n`;
-      markdown += `- **ID**: \`${resource.id}\`\n`;
-      markdown += `- **Format**: ${resource.format || 'Unknown'}\n`;
-      if (resource.description) markdown += `- **Description**: ${resource.description}\n`;
-      markdown += `- **URL**: ${resource.url}\n`;
+      markdown += `### ${sanitizeInline(resource.name || 'Unnamed Resource')}\n\n`;
+      markdown += `- **ID**: \`${sanitizeInline(resource.id)}\`\n`;
+      markdown += `- **Format**: ${sanitizeInline(resource.format || 'Unknown')}\n`;
+      if (resource.description) markdown += `- **Description**:\n\n${wrapUntrusted(resource.description)}\n\n`;
+      markdown += `- **URL**: ${safeUrlText(resource.url)}\n`;
       const accessServices = parseAccessServices(resource);
       const accessEndpoints = extractServiceEndpoints(accessServices);
       if (accessEndpoints.length > 0) {
@@ -336,7 +587,7 @@ export const formatPackageShowMarkdown = (result: CkanPackage, serverUrl: string
       }
       const effectiveDownloadUrl = resolveDownloadUrl(resource);
       if (effectiveDownloadUrl) {
-        markdown += `- **Effective Download URL**: ${effectiveDownloadUrl}\n`;
+        markdown += `- **Effective Download URL**: ${safeUrlText(effectiveDownloadUrl)}\n`;
       }
       if (resource.size) {
         const formatBytes = (bytes: number) => {
@@ -358,7 +609,7 @@ export const formatPackageShowMarkdown = (result: CkanPackage, serverUrl: string
       } else {
         markdown += `- **DataStore**: ❓ Not reported by portal\n`;
       }
-      markdown += `- **Full JSON metadata**: ${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/resource_show?id=${resource.id}\n`;
+      markdown += `- **Full JSON metadata**: ${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/resource_show?id=${encodeURIComponent(resource.id)}\n`;
       markdown += '\n';
     }
   }
@@ -366,7 +617,7 @@ export const formatPackageShowMarkdown = (result: CkanPackage, serverUrl: string
   if (result.extras && result.extras.length > 0) {
     markdown += `## Extra Fields\n\n`;
     for (const extra of result.extras) {
-      markdown += `- **${extra.key}**: ${extra.value}\n`;
+      markdown += `- **${sanitizeInline(extra.key)}**: ${sanitizeInline(extra.value)}\n`;
     }
     markdown += '\n';
   }
@@ -465,10 +716,15 @@ function normalizePackage(pkg: CkanPackage): CkanPackage {
 /**
  * Compact JSON representation of package_search results.
  * Keeps only essential fields to reduce token usage (~80% reduction).
+ *
+ * `effective_query` appears only when the server rewrote the caller's query — the
+ * markdown format has always shown it, and a JSON caller had no way to tell which
+ * query actually ran.
  */
-export function compactSearchResult(result: any, serverUrl?: string): object {
+export function compactSearchResult(result: any, serverUrl?: string, effectiveQuery?: string): object {
   return {
     count: result.count,
+    ...(effectiveQuery ? { effective_query: effectiveQuery } : {}),
     results: (result.results || []).map((rawPkg: CkanPackage) => {
       const pkg = serverUrl && requiresMultilingualNormalization(serverUrl) ? normalizePackage(rawPkg) : rawPkg;
       return {
@@ -517,6 +773,7 @@ export function compactPackageShow(result: CkanPackage, serverUrl?: string): obj
     holder_name: result.holder_name || null,
     hvd_category: result.hvd_category || null,
     applicable_legislation: result.applicable_legislation || null,
+    temporal_coverage: readTemporalCoverage(result).map((p) => ({ ...p, start_equals_issued: startEqualsIssued(p, result.issued) })),
     resources: (result.resources || []).map((r: CkanResource) => ({
       id: r.id,
       name: r.name || null,
@@ -757,10 +1014,11 @@ Typical workflow: ckan_status_show (check locale) → ckan_package_search (query
           if (!effectiveSort) effectiveSort = "issued desc, metadata_created desc";
         }
 
-        // For portals not explicitly configured in portals.json, auto-detect
-        // whether they need text:(...) wrapping by probing with a two-term OR query.
+        // Only a boolean query can benefit from text:(...) wrapping, so only a boolean
+        // query pays for the probe. Every portal is probed, configured ones included:
+        // the values that used to live in portals.json went stale.
         let parserOverride = params.query_parser;
-        if (!parserOverride && !isPortalSearchExplicitlyConfigured(params.server_url)) {
+        if (!parserOverride && mayNeedTextWrapping(query)) {
           const needsText = await probePortalParser(params.server_url);
           if (needsText) parserOverride = "text";
         }
@@ -799,7 +1057,10 @@ Typical workflow: ckan_status_show (check locale) → ckan_package_search (query
           const { effectiveQuery: strippedEffective } = resolveSearchQuery(
             params.server_url,
             strippedQuery,
-            params.query_parser
+            // parserOverride, not params.query_parser: the probe's verdict must
+            // survive the retry, or an accented boolean query is re-sent to the
+            // parser that ignores booleans.
+            parserOverride
           );
           const fallbackResult = await makeCkanRequest<any>(
             params.server_url,
@@ -813,7 +1074,11 @@ Typical workflow: ckan_status_show (check locale) → ckan_package_search (query
         }
 
         if (params.response_format === ResponseFormat.JSON) {
-          const compact = compactSearchResult(result, params.server_url);
+          const compact = compactSearchResult(
+            result,
+            params.server_url,
+            effectiveQuery !== params.q ? effectiveQuery : undefined
+          );
           return {
             content: [{ type: "text", text: truncateJson(compact) }]
           };
@@ -884,11 +1149,11 @@ ${hvdNote}`;
           markdown += `## Datasets\n\n`;
           for (const rawPkg of result.results) {
             const pkg = requiresMultilingualNormalization(params.server_url) ? normalizePackage(rawPkg) : rawPkg;
-            markdown += `### ${pkg.title || pkg.name}\n\n`;
-            markdown += `- **ID**: \`${pkg.id}\`\n`;
-            markdown += `- **Name**: \`${pkg.name}\`\n`;
+            markdown += `### ${sanitizeInline(pkg.title || pkg.name)}\n\n`;
+            markdown += `- **ID**: \`${sanitizeInline(pkg.id)}\`\n`;
+            markdown += `- **Name**: \`${sanitizeInline(pkg.name)}\`\n`;
             if (pkg.organization) {
-              markdown += `- **Organization**: ${pkg.organization.title || pkg.organization.name}\n`;
+              markdown += `- **Organization**: ${sanitizeInline(pkg.organization.title || pkg.organization.name)}\n`;
             }
             if (pkg.notes) {
               const notes = pkg.notes.substring(0, 200);
@@ -896,7 +1161,7 @@ ${hvdNote}`;
             }
             if (pkg.tags && pkg.tags.length > 0) {
               const tags = pkg.tags.slice(0, 5).map((t: CkanTag) => t.name).join(', ');
-              markdown += `- **Tags**: ${tags}${pkg.tags.length > 5 ? ', ...' : ''}\n`;
+              markdown += `- **Tags**: ${sanitizeInline(tags)}${pkg.tags.length > 5 ? ', ...' : ''}\n`;
             }
             markdown += `- **Resources**: ${pkg.num_resources || 0}\n`;
             markdown += `- **Modified**: ${formatDate(pkg.metadata_modified)}\n`;
@@ -906,7 +1171,10 @@ ${hvdNote}`;
           markdown += `No datasets found matching your query.\n`;
           markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
           if (isPlainMultiTermQuery(params.q)) {
-            markdown += `\n> **Tip**: Multi-term queries use AND by default (all terms must match). Try OR to broaden the search:\n`;
+            // CKAN's dismax applies mm='2<-1 5<80%', so a plain multi-term query is
+            // already a partial match: spelling out OR relaxes it the rest of the way
+            // and, on portals that ignore boolean operators, switches parser too.
+            markdown += `\n> **Tip**: With several terms the portal requires most of them to match. Spelling out OR broadens the search:\n`;
             markdown += `> \`q: "${buildOrQuery(params.q)}"\`\n`;
           }
         }
@@ -925,10 +1193,7 @@ ${hvdNote}`;
         };
       } catch (error) {
         return {
-          content: [{
-            type: "text",
-            text: `Error searching packages: ${error instanceof Error ? error.message : String(error)}`
-          }],
+          content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_package_search"), params.response_format === ResponseFormat.JSON) }],
           isError: true
         };
       }
@@ -955,7 +1220,9 @@ Args:
   - query (string): Natural language or keyword query (e.g., "mobilità urbana", "air quality")
   - limit (number): Number of datasets to return (default: 10)
   - weights (object): Field weights for scoring — higher weight = more influence on rank
-    Default: title=4, tags=3, notes=2, organization=1, holder=4, publisher=2
+    Default: title=4, tags=3, notes=2, organization=1, holder=4, publisher=2, coverage=4
+    coverage: bonus for datasets the portal returned with every query term required
+    (Solr mm=100%); these are fetched first, the rest fills in when they are fewer than limit
     Note on holder vs organization: on federated catalogs (e.g. dati.gov.it), \`organization\`
     is the harvesting catalog (e.g. Regione Puglia), while \`holder\` (DCAT-AP_IT dct:rightsHolder)
     is the actual data owner (e.g. Comune di Lecce). Queries like "datasets from a specific Comune"
@@ -994,7 +1261,8 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
           tags: z.coerce.number().min(0).optional().describe("Weight for tag match (default 3)"),
           organization: z.coerce.number().min(0).optional().describe("Weight for organization (CKAN catalog / harvester) match (default 1)"),
           holder: z.coerce.number().min(0).optional().describe("Weight for holder_name match — DCAT-AP_IT dct:rightsHolder, the actual data owner (default 4)"),
-          publisher: z.coerce.number().min(0).optional().describe("Weight for publisher_name match — DCAT-AP_IT dct:publisher (default 2)")
+          publisher: z.coerce.number().min(0).optional().describe("Weight for publisher_name match — DCAT-AP_IT dct:publisher (default 2)"),
+          coverage: z.coerce.number().min(0).optional().describe("Bonus for datasets the portal returned with every query term required (default 4)")
         }).optional().describe("Per-field scoring weights; unspecified fields use defaults"),
         query_parser: z.enum(["default", "text"])
           .optional()
@@ -1015,36 +1283,59 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
           ...(params.weights ?? {})
         };
 
-        const rows = Math.min(Math.max(params.limit * 5, params.limit), 100);
+        // At least 50 candidates to score: the local ranking only sees what Solr
+        // returns first, and a small limit used to shrink the window to 15 — enough
+        // when a search returned a handful of results, not enough now that it returns
+        // hundreds.
+        const rows = Math.min(Math.max(params.limit * 5, 50), 100);
+
+        // Same probe as ckan_package_search: without it this tool sends a boolean
+        // query to the parser that ignores booleans. On dati.comune.milano.it
+        // `aria OR acqua` returned 0 here against 87 there.
+        let parserOverride = params.query_parser;
+        if (!parserOverride && mayNeedTextWrapping(params.query)) {
+          const needsText = await probePortalParser(params.server_url);
+          if (needsText) parserOverride = "text";
+        }
+
         const { effectiveQuery } = resolveSearchQuery(
           params.server_url,
           params.query,
-          params.query_parser
+          parserOverride
         );
 
-        const searchResult = await makeCkanRequest<any>(
-          params.server_url,
-          'package_search',
-          {
-            q: effectiveQuery,
-            rows,
-            start: 0
-          }
-        );
+        // Strict pass first: `mm=100%` asks Solr for datasets carrying every query term,
+        // matched with its own stemming across `qf`. No local re-ranking can surface a
+        // dataset the portal never returned — on dati.gov.it none of the top 50 for
+        // `qualità dell'aria Milano` mentioned Milano — so the window is the lever, not
+        // the score. A fielded, wrapped or boolean query carries its own logic and is
+        // sent as written: a colon leaves dismax, and `mm` with it. When the strict pass
+        // comes up short, the default pass fills in.
+        const strictEligible =
+          !effectiveQuery.includes(":") && !hasExplicitBooleanOperator(params.query);
+        const fetchCandidates = (extra: Record<string, unknown>) =>
+          makeCkanRequest<any>(params.server_url, 'package_search', { q: effectiveQuery, rows, start: 0, ...extra });
 
-        const scored = (searchResult.results || []).map((dataset: CkanPackage) => {
-          const { total, breakdown } = scoreDatasetRelevance(
-            params.query,
-            dataset,
-            weights
-          );
+        // `mm` is on CKAN's parameter whitelist, but a portal that rejects it must not
+        // take the whole tool down: the strict pass is an improvement, not a dependency.
+        const strictResult = strictEligible ? await fetchCandidates({ mm: "100%" }).catch(() => null) : null;
+        const strictHits: CkanPackage[] = strictResult?.results ?? [];
+        // The default pass always runs, so `total_results` keeps its meaning — the whole
+        // catalog match, not the strict subset. When the strict pass already filled the
+        // limit only the count is needed, and rows=0 makes that request tiny.
+        const fillResult = await fetchCandidates(strictHits.length >= params.limit ? { rows: 0 } : {});
+        const seen = new Set(strictHits.map((d) => d.id));
+        const fillHits: CkanPackage[] = (fillResult?.results ?? []).filter((d: CkanPackage) => !seen.has(d.id));
 
-          return {
-            dataset,
-            score: total,
-            breakdown
-          };
-        });
+        const scoreOne = (dataset: CkanPackage, fullCoverage: boolean) => {
+          const { total, breakdown } = scoreDatasetRelevance(params.query, dataset, weights, fullCoverage);
+          return { dataset, score: total, breakdown };
+        };
+        const scored = [
+          ...strictHits.map((d) => scoreOne(d, true)),
+          ...fillHits.map((d) => scoreOne(d, false))
+        ];
+        const searchResult = fillResult;
 
         scored.sort((a, b) => b.score - a.score);
 
@@ -1067,15 +1358,13 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
           terms: extractQueryTerms(params.query),
           weights,
           total_results: searchResult.count ?? 0,
+          all_terms_results: strictResult ? (strictResult.count ?? 0) : null,
           returned: top.length,
           results: top
         };
 
         if (params.response_format === ResponseFormat.JSON) {
-          return {
-            content: [{ type: "text", text: truncateText(JSON.stringify(payload, null, 2)) }],
-            structuredContent: payload
-          };
+          return jsonToolResult(payload);
         }
 
         let markdown = `# Relevant CKAN Datasets\n\n`;
@@ -1103,17 +1392,18 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
 
           top.forEach((dataset, index) => {
             const tags = dataset.tags.slice(0, 3).join(', ');
-            markdown += `| ${index + 1} | ${dataset.name} | ${dataset.score} | ${dataset.title} | ${dataset.organization || '-'} | ${tags || '-'} |\n`;
+            markdown += `| ${index + 1} | ${sanitizeInline(dataset.name)} | ${dataset.score} | ${sanitizeInline(dataset.title)} | ${sanitizeInline(dataset.organization || '-')} | ${sanitizeInline(tags || '-')} |\n`;
           });
 
           markdown += `\n### Score Breakdown\n\n`;
           top.forEach((dataset, index) => {
-            markdown += `**${index + 1}. ${dataset.title}**\n`;
+            markdown += `**${index + 1}. ${sanitizeInline(dataset.title)}**\n`;
             markdown += `- Title: ${dataset.breakdown.title}\n`;
             markdown += `- Notes: ${dataset.breakdown.notes}\n`;
             markdown += `- Tags: ${dataset.breakdown.tags}\n`;
             markdown += `- Organization: ${dataset.breakdown.organization}\n`;
             markdown += `- Holder: ${dataset.breakdown.holder}\n`;
+            markdown += `- Coverage (every term, per the portal): ${dataset.breakdown.coverage}\n`;
             markdown += `- Publisher: ${dataset.breakdown.publisher}\n`;
             markdown += `- Total: ${dataset.breakdown.total}\n\n`;
           });
@@ -1124,10 +1414,7 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
         };
       } catch (error) {
         return {
-          content: [{
-            type: "text",
-            text: `Error ranking datasets: ${error instanceof Error ? error.message : String(error)}`
-          }],
+          content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_find_relevant_datasets"), params.response_format === ResponseFormat.JSON) }],
           isError: true
         };
       }
@@ -1163,6 +1450,8 @@ Returns (JSON format):
   author, maintainer,
   frequency, language, publisher_name, holder_name,
   hvd_category, applicable_legislation,
+  temporal_coverage (array of {start, end, start_equals_issued} from dct:temporal; empty if absent;
+    start_equals_issued=true when start = issued and no end: on dcatapit portals an export default, not a data period),
   resources (id, name, format, url, size, datastore_active, created, last_modified, api_json_url),
   view_url, api_json_url
 
@@ -1204,10 +1493,7 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
 
         if (params.response_format === ResponseFormat.JSON) {
           const compact = compactPackageShow(enrichPackageShowResult(result), params.server_url);
-          return {
-            content: [{ type: "text", text: truncateJson(compact) }],
-            structuredContent: compact
-          };
+          return jsonToolResult(compact);
         }
 
         const markdown = formatPackageShowMarkdown(result, params.server_url);
@@ -1216,15 +1502,21 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
         };
       } catch (error) {
         return {
-          content: [{
-            type: "text",
-            text: `Error fetching package: ${error instanceof Error ? error.message : String(error)}`
-          }],
+          content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_package_show"), params.response_format === ResponseFormat.JSON) }],
           isError: true
         };
       }
     }
   );
+
+  async function checkSourceDatastore(portalUrl: string, resourceId: string): Promise<boolean> {
+    try {
+      await makeCkanRequest(portalUrl, 'datastore_search', { resource_id: resourceId, limit: 0 }, { cache: false });
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * List resources in a dataset with a compact summary
@@ -1251,7 +1543,13 @@ Examples:
   - { server_url: "https://dati.gov.it/opendata", id: "dataset-name" }
   - { server_url: "...", id: "dataset-name", format_filter: "CSV" }
 
-Typical workflow: ckan_package_search → ckan_list_resources (assess available files) → ckan_datastore_search (for resources with DataStore=true)`,
+Typical workflow: ckan_package_search → ckan_list_resources (assess available files) → ckan_datastore_search (for resources with DataStore=true)
+
+When a resource has DataStore=false but its download URL belongs to a different (source) portal,
+the tool can probe the source portal for DataStore availability and report
+source_datastore_active and source_portal_url so you can query the data there instead.
+This probing is OFF by default (it issues extra HTTP requests to hosts taken from the
+dataset's own resource URLs); set check_source_portal=true to enable it.`,
       inputSchema: z.object({
         server_url: z.string()
           .url()
@@ -1262,6 +1560,9 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
         format_filter: z.string()
           .optional()
           .describe("Filter resources by format, case-insensitive (e.g., 'CSV', 'json', 'XLSX')"),
+        check_source_portal: z.boolean()
+          .optional()
+          .describe("Opt-in (default false): when true, probes the source portal for DataStore availability when a resource URL points to a different CKAN instance. Issues extra HTTP requests to hosts taken from the dataset's resource URLs."),
         response_format: ResponseFormatSchema
       }).strict(),
       annotations: {
@@ -1281,8 +1582,18 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
 
         const resources = Array.isArray(result.resources) ? result.resources : [];
         const formatFilter = params.format_filter?.toUpperCase();
+        const doSourceCheck = params.check_source_portal === true;
 
-        const summary = resources
+        const summary: {
+          name: string;
+          id: string;
+          format: string;
+          size: string | null;
+          datastore_active: boolean;
+          url: string | null;
+          source_datastore_active?: boolean;
+          source_portal_url?: string | null;
+        }[] = resources
           .filter((r: CkanResource) => !formatFilter || (r.format || "").toUpperCase() === formatFilter)
           .map((r: CkanResource) => {
             const effectiveUrl = resolveDownloadUrl(r);
@@ -1296,6 +1607,25 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
             };
           });
 
+        if (doSourceCheck) {
+          // Cap the number of outbound probes so one call cannot fan out to an
+          // attacker-chosen number of requests (GHSA-3369 amplification).
+          const MAX_SOURCE_PROBES = 10;
+          const probes = summary
+            .map((item, idx) => ({ item, idx }))
+            .filter(({ item }) => !item.datastore_active && extractSourcePortal(item.url, params.server_url))
+            .slice(0, MAX_SOURCE_PROBES);
+          await Promise.all(
+            probes.map(async ({ item, idx }) => {
+              const extracted = extractSourcePortal(item.url, params.server_url);
+              if (!extracted) return;
+              const active = await checkSourceDatastore(extracted.portalUrl, extracted.resourceId);
+              summary[idx].source_datastore_active = active;
+              summary[idx].source_portal_url = active ? extracted.portalUrl : null;
+            })
+          );
+        }
+
         if (params.response_format === ResponseFormat.JSON) {
           const payload = {
             dataset_id: result.id,
@@ -1306,15 +1636,12 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
             format_filter: formatFilter ?? null,
             resources: summary
           };
-          return {
-            content: [{ type: "text", text: truncateText(JSON.stringify(payload, null, 2)) }],
-            structuredContent: payload
-          };
+          return jsonToolResult(payload);
         }
 
-        let markdown = `# Resources: ${result.title || result.name}\n\n`;
+        let markdown = `# Resources: ${sanitizeInline(result.title || result.name)}\n\n`;
         markdown += `**Server**: ${params.server_url}\n`;
-        markdown += `**Dataset**: \`${result.name}\` (\`${result.id}\`)\n`;
+        markdown += `**Dataset**: \`${sanitizeInline(result.name)}\` (\`${sanitizeInline(result.id)}\`)\n`;
         markdown += `**Total Resources**: ${resources.length}`;
         if (formatFilter) {
           markdown += ` (showing ${summary.length} ${formatFilter})`;
@@ -1328,18 +1655,29 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
           markdown += `| Name | Format | Size | DataStore | ID |\n`;
           markdown += `| --- | --- | --- | --- | --- |\n`;
 
+          // Neutralize portal-controlled names so they cannot break the table
+          // structure or inject markdown (GHSA-c499).
+          const cell = sanitizeInline;
           for (const r of summary) {
-            const name = r.name.length > 40 ? r.name.substring(0, 37) + '...' : r.name;
+            const clipped = r.name.length > 40 ? r.name.substring(0, 37) + '...' : r.name;
             const ds = r.datastore_active ? 'Yes' : 'No';
             const size = r.size || '-';
-            markdown += `| ${name} | ${r.format} | ${size} | ${ds} | \`${r.id}\` |\n`;
+            markdown += `| ${cell(clipped)} | ${cell(r.format)} | ${size} | ${ds} | \`${sanitizeInline(r.id)}\` |\n`;
           }
 
           const dsResources = summary.filter((r) => r.datastore_active);
           if (dsResources.length > 0) {
             markdown += `\n**DataStore-enabled resources** (queryable with \`ckan_datastore_search\`):\n`;
             for (const r of dsResources) {
-              markdown += `- **${r.name}** (${r.format}): \`${r.id}\`\n`;
+              markdown += `- **${cell(r.name)}** (${cell(r.format)}): \`${sanitizeInline(r.id)}\`\n`;
+            }
+          }
+
+          const sourceResources = summary.filter((r) => r.source_datastore_active && r.source_portal_url);
+          if (sourceResources.length > 0) {
+            markdown += `\n**Available on source portal** (use \`ckan_datastore_search\` with the source portal URL):\n`;
+            for (const r of sourceResources) {
+              markdown += `- **${cell(r.name)}** (${cell(r.format)}): \`${sanitizeInline(r.id)}\` on ${safeUrlText(r.source_portal_url)}\n`;
             }
           }
         }
@@ -1349,10 +1687,7 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
         };
       } catch (error) {
         return {
-          content: [{
-            type: "text",
-            text: `Error listing resources: ${error instanceof Error ? error.message : String(error)}`
-          }],
+          content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_list_resources"), params.response_format === ResponseFormat.JSON) }],
           isError: true
         };
       }

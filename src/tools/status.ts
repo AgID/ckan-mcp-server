@@ -3,9 +3,9 @@
  */
 
 import { z } from "zod";
-import { makeCkanRequest } from "../utils/http.js";
-import { addDemoFooter } from "../utils/formatting.js";
-import { getPortalSparqlConfig, getPortalHvdConfig } from "../utils/portal-config.js";
+import { makeCkanRequest, formatCkanError, CkanApiError } from "../utils/http.js";
+import { truncateText, cappedStructured, addDemoFooter } from "../utils/formatting.js";
+import { getPortalSparqlConfig, getPortalHvdConfig, getPortalMigration } from "../utils/portal-config.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 export function formatStatusMarkdown(result: { ckan_version?: string; site_title?: string; site_url?: string; locale_default?: string }, serverUrl: string, hvdCount?: number): string {
@@ -69,15 +69,23 @@ Typical workflow: ckan_status_show (verify server is up) → ckan_package_search
 
         const markdown = formatStatusMarkdown(result, params.server_url, hvdCount);
 
+        // Text channel is Markdown, so there is no truncated JSON to derive the structured
+        // payload from — cap it on its own. status_show is echoed straight from the portal,
+        // so its field lengths are upstream-controlled and not bounded by anything (#39).
         return {
-          content: [{ type: "text", text: addDemoFooter(markdown) }],
-          structuredContent: result
+          content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }],
+          structuredContent: cappedStructured(result)
         };
       } catch (error) {
+        // A portal that left CKAN is neither offline nor invalid: the migration notice
+        // is the whole diagnosis, and the usual prefix would contradict it.
+        const migrated =
+          error instanceof CkanApiError && error.serverUrl && getPortalMigration(error.serverUrl);
+        const detail = formatCkanError(error, "ckan_status_show");
         return {
           content: [{
             type: "text",
-            text: `Server appears to be offline or not a valid CKAN instance:\n${error instanceof Error ? error.message : String(error)}`
+            text: migrated ? detail : `Server appears to be offline or not a valid CKAN instance:\n${detail}`
           }],
           isError: true
         };

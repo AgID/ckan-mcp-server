@@ -16,9 +16,9 @@ The server is ideal for Workers deployment:
 
 - ✅ **Stateless**: No database or persistent state
 - ✅ **Read-only**: All operations are GET-only
-- ✅ **Lightweight**: Small bundle (~400KB)
+- ✅ **Lightweight**: Small bundle (~530KB)
 - ✅ **Global edge**: Low latency worldwide
-- ✅ **Free tier**: 100,000 requests/day
+- ✅ **Free tier**: 100,000 requests/day (enough to start; see Cost Breakdown)
 
 ## Step-by-Step Deployment
 
@@ -139,7 +139,7 @@ curl -X POST http://localhost:8787/mcp \
 curl -X POST http://localhost:8787/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ckan_status_show","arguments":{"server_url":"https://demo.ckan.org"}},"id":2}'
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ckan_status_show","arguments":{"server_url":"https://www.dati.gov.it/opendata"}},"id":2}'
 ```
 
 Stop local server: Press `x` or `Ctrl+C`
@@ -231,7 +231,7 @@ curl -X POST https://ckan-mcp-server.<your-account>.workers.dev/mcp \
 curl -X POST https://ckan-mcp-server.<your-account>.workers.dev/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ckan_status_show","arguments":{"server_url":"https://demo.ckan.org"}},"id":2}'
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"ckan_status_show","arguments":{"server_url":"https://www.dati.gov.it/opendata"}},"id":2}'
 ```
 
 ---
@@ -283,7 +283,7 @@ Add environment variables in `wrangler.toml`:
 
 ```toml
 [vars]
-DEFAULT_CKAN_SERVER = "https://demo.ckan.org"
+DEFAULT_CKAN_SERVER = "https://www.dati.gov.it/opendata"
 LOG_LEVEL = "info"
 ```
 
@@ -355,11 +355,15 @@ wrangler login
 
 ### Error: "Worker exceeded CPU time limit"
 
-Check if you're making blocking operations. CKAN API calls are async (I/O-bound), so this should be rare.
+Check if you're making blocking operations. CKAN API calls are async (I/O-bound), so this
+should be rare — but on the ondata deployment it is not: 22 occurrences in the first four
+days of September 2026 (6% of calls) against 11 in the whole of August (0.8%). These
+events carry no tool or server in the telemetry, so they were not attributable until
+`script_version` was added to the archive on 2026-09-05. Unexplained so far.
 
 ### Error: "Script too large"
 
-Current bundle: ~400KB (limit: 1MB). If you hit this:
+Current bundle: ~530KB (limit: 1MB). If you hit this:
 
 ```bash
 # Analyze bundle size
@@ -393,7 +397,7 @@ npm run deploy
 
 ### 2. Monitor Usage
 
-Free tier includes 100k requests/day. Monitor in Cloudflare dashboard.
+The free tier includes 100k requests/day. Monitor in the Cloudflare dashboard.
 
 ### 3. Set Up Alerts (Optional)
 
@@ -416,17 +420,23 @@ View deployment versions in Cloudflare dashboard.
 
 ## Cost Breakdown
 
-**Free Tier** (default):
+**Free Tier** (what a new deployment gets):
 - 100,000 requests/day
 - 10ms CPU time per request
 - Workers KV: 1GB storage
 - Automatic HTTPS
 
-**Paid Plans** (if needed):
-- **Workers Paid** ($5/month): 10M requests/month
-- **Workers Unbound**: Pay-per-use beyond free tier
+**Paid Plans**:
+- **Workers Paid** ($5/month): 10M requests/month included
+- **Workers Unbound**: pay-per-use beyond that
 
-For most users, **free tier is sufficient**.
+For most users the free tier is sufficient.
+
+> **The ondata deployment is not on the free tier.** Workers Observability keeps
+> 7 days of telemetry there, against 3 on the free plan (measured 2026-09-05:
+> events returned at 7 days back, none at 8). So the free-tier request and CPU
+> limits above are not the ones it operates under — check the dashboard before
+> reasoning about its quota. They do apply to a fresh deployment of your own.
 
 ---
 
@@ -460,6 +470,7 @@ Update the version in **all** of these files — missing any one causes version 
 - `package.json`
 - `package-lock.json`
 - `manifest.json` (DXT packaging)
+- `server.json` (MCP Registry entry — **two** fields: top-level `version` and `packages[0].version`)
 - `src/server.ts` (MCP server name/version)
 - `src/worker.ts` (health endpoint — `version` field + `tools` count)
 
@@ -470,17 +481,10 @@ Update the version in **all** of these files — missing any one causes version 
 
 ```bash
 OLD=0.4.93 NEW=0.4.94
-sed -i "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/g" package.json package-lock.json manifest.json
+sed -i "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/g" package.json package-lock.json manifest.json server.json
 sed -i "s/version: \"$OLD\"/version: \"$NEW\"/" src/server.ts
 sed -i "s/version: '$OLD'/version: '$NEW'/" src/worker.ts
-```
-
-Edit `package.json` and bump version:
-
-```json
-{
-  "version": "0.5.0"
-}
+grep -rn "$OLD" package.json manifest.json server.json src/server.ts src/worker.ts  # must print nothing
 ```
 
 ### Step 2: Update Changelog
@@ -498,29 +502,39 @@ Add entry to `LOG.md` with current date (YYYY-MM-DD format) at the top:
 - **No breaking changes**: Confirm backward compatibility
 ```
 
-### Step 3: Commit Changes
+### Step 3: Commit Changes on a Branch
+
+Code changes never go straight to `main`: work on a branch and merge through a pull
+request. Only documentation-only changes may be committed to `main` directly.
 
 ```bash
+git checkout -b <type>/<short-description>
 git add .
 git commit -m "Add feature name (v0.5.0)
 
 - Detailed description of changes
 - List key improvements
-- Note any breaking changes (if any)
-
-Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
+- Note any breaking changes (if any)"
 ```
 
-### Step 4: Push to GitHub
-
-Before pushing, check if the remote has new commits (e.g. from another machine or collaborator):
+### Step 4: Open a Pull Request and Merge It
 
 ```bash
-git pull --rebase origin main
-git push origin main
+git push -u origin <type>/<short-description>
+gh pr create --base main --title "..." --body "..."
+gh pr checks <number>          # wait for green
+gh pr merge <number> --squash --delete-branch
+git checkout main && git pull
 ```
 
-Verify: Check https://github.com/ondata/ckan-mcp-server commits
+Verify: check https://github.com/ondata/ckan-mcp-server commits
+
+> `main` carries a `non_fast_forward` rule, so a commit pushed there by mistake cannot be
+> removed with a force-push — it takes a revert, and the history keeps both. There is no
+> rule *requiring* pull requests, so a direct push succeeds silently: the discipline is
+> yours, not the server's.
+
+The tag in the next step must point at the squashed commit on `main`, not at the branch.
 
 ### Step 5: Create Git Tag
 
@@ -540,6 +554,12 @@ git push origin v0.5.0
 ```
 
 Verify: Tag appears in https://github.com/ondata/ckan-mcp-server/tags
+
+**Pushing the tag triggers the npm publish** (`.github/workflows/release.yml`: checks the tag matches `package.json`, builds, tests, `npm publish --provenance`). Watch it:
+
+```bash
+gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')
+```
 
 ### Step 7: Create GitHub Release
 
@@ -568,10 +588,11 @@ Verify: Release appears as "Latest" at https://github.com/ondata/ckan-mcp-server
 
 ```bash
 npm run pack:dxt
-gh release upload v0.5.0 ckan-mcp-server.dxt
+npm run pack:skill
+gh release upload v0.5.0 ckan-mcp-server.dxt tmp/ckan-mcp.skill
 ```
 
-Verify: `ckan-mcp-server.dxt` appears as a release asset on the GitHub releases page.
+Verify: `ckan-mcp-server.dxt` and `ckan-mcp.skill` appear as release assets on the GitHub releases page.
 
 **Important**: Keep GitHub releases in sync with npm. Do not leave GitHub behind npmjs.
 
@@ -588,20 +609,27 @@ If npm is ahead, create the missing GitHub release(s) from existing tags:
 gh release create v0.X.Y --generate-notes
 ```
 
-### Step 8: Publish to npm
+### Step 8: Verify npm and publish to the MCP Registry
 
-```bash
-NPM_CONFIG_CACHE=/tmp/npm-cache npm publish
-```
-
-> **Warning**: Never pipe `npm publish` into `grep` or any filter before chaining with `&&`.
-> The pipe transfers `grep`'s exit code (1 if no match), not npm's — causing subsequent commands to be silently skipped.
-> Always run `npm publish` alone, then run the next step separately.
+npm is published by CI when the tag is pushed (Step 6). **Do not run `npm publish` by hand**: the two paths collide and the loser gets `EPUBLISHCONFLICT`.
 
 Verify:
-- Check https://www.npmjs.com/package/@aborruso/ckan-mcp-server
-- Version updated
-- Package installable: `npm install @aborruso/ckan-mcp-server`
+
+```bash
+npm view @aborruso/ckan-mcp-server version
+npm view @aborruso/ckan-mcp-server@0.5.0 dist.attestations   # provenance present
+```
+
+Then publish the same version to the MCP Registry — only **after** npm is live, the registry validates that the npm version exists:
+
+```bash
+mcp-publisher login github   # device flow, opens a browser; needed when the token has expired
+mcp-publisher publish
+curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.aborruso/ckan-mcp-server" | \
+  jq -r '.servers[] | select(.server.name|test("aborruso")) | "\(.server.version) | latest \(._meta["io.modelcontextprotocol.registry/official"].isLatest)"'
+```
+
+`npm publish` does not update the registry: skipping this step pins registry installs to the previous version.
 
 ### Step 9: Deploy to Cloudflare Workers
 
@@ -623,6 +651,10 @@ Verify:
 Use this checklist to ensure nothing is missed:
 
 ### Pre-Release
+- [ ] **Release gate green**: `npm run smoke` — known-answer search queries against live
+      portals, asserting *which* dataset comes back rather than how many. v0.4.122 shipped
+      with counts verified and ranking broken; "22 results" and "the right dataset first"
+      are different claims, and only the second one is what a user asked for
 - [ ] Security audit clean: `npm audit` (0 vulnerabilities)
 - [ ] All tests passing: `npm test`
 - [ ] Code builds successfully: `npm run build`
@@ -630,7 +662,7 @@ Use this checklist to ensure nothing is missed:
 - [ ] Local testing complete: `npm run dev:worker`
 
 ### Version Update
-- [ ] Version bumped in `package.json`, `manifest.json`, `src/server.ts`, `src/worker.ts`
+- [ ] Version bumped in `package.json`, `package-lock.json`, `manifest.json`, `server.json` (two fields), `src/server.ts`, `src/worker.ts`
 - [ ] Tool count updated in `src/worker.ts` health endpoint (if tools added/removed)
 - [ ] `LOG.md` updated with changes
 - [ ] `CLAUDE.md` updated if architecture changed
@@ -641,15 +673,16 @@ Use this checklist to ensure nothing is missed:
 > The `prepack`/`postpack` hooks in `package.json` swap them automatically during `npm publish`.
 
 ### Git Operations
-- [ ] Changes committed with descriptive message
-- [ ] Pushed to GitHub main branch
-- [ ] Git tag created (format: v0.X.Y)
+- [ ] Code changes committed on a branch, never on `main`
+- [ ] Pull request opened, checks green, squash-merged
+- [ ] Git tag created on the merged commit (format: v0.X.Y)
 - [ ] Tag pushed to GitHub
 
 ### Publishing
 - [ ] GitHub Release created with notes
-- [ ] DXT built and uploaded: `npm run pack:dxt && gh release upload vX.Y.Z ckan-mcp-server.dxt`
-- [ ] npm package published (check npmjs.com)
+- [ ] DXT + skill built and uploaded: `npm run pack:dxt && npm run pack:skill && gh release upload vX.Y.Z ckan-mcp-server.dxt tmp/ckan-mcp.skill`
+- [ ] npm published by CI on tag push (`gh run watch`, then `npm view ... dist.attestations`)
+- [ ] MCP Registry published (`mcp-publisher publish`, verify `isLatest=true`)
 - [ ] GitHub release not behind npm (verify `gh release list` + `npm view @aborruso/ckan-mcp-server version`)
 - [ ] Cloudflare Workers deployed (if code changed)
 
@@ -671,7 +704,8 @@ Use this checklist to ensure nothing is missed:
 Not every change requires publishing to all platforms:
 
 ### Always Required
-- **GitHub**: Commit + Push (every change)
+- **GitHub**: commit + push (every change) — code goes through a branch and a pull
+  request, documentation-only changes may go to `main` directly
 
 ### Sometimes Required
 - **Git Tag**: Only for versioned releases (v0.X.Y)
@@ -681,11 +715,11 @@ Not every change requires publishing to all platforms:
 
 ### Decision Matrix
 
-| Change Type | GitHub Commit | Git Tag | GitHub Release | npm Publish | Cloudflare Deploy |
-|------------|---------------|---------|----------------|-------------|-------------------|
+| Change Type | Branch + PR | Git Tag | GitHub Release | npm Publish | Cloudflare Deploy |
+|------------|-------------|---------|----------------|-------------|-------------------|
 | Bug fix in tools | ✅ | ✅ | ✅ | ✅ | ✅ |
 | New tool added | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Documentation only | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Documentation only | ❌ (commit to `main`) | ❌ | ❌ | ❌ | ❌ |
 | Workers optimization | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Test improvements | ✅ | ❌ | ❌ | ❌ | ❌ |
 
@@ -695,14 +729,14 @@ Not every change requires publishing to all platforms:
 
 ## Common Issues
 
-### "npm publish" fails with 403
+### Release workflow fails or npm shows the old version
 
-**Problem**: Already published this version
+**Problem**: The tag does not match `package.json`, or `npm publish` was also run by hand (`EPUBLISHCONFLICT`)
 
 **Solution**:
 1. Check current npm version: `npm view @aborruso/ckan-mcp-server version`
-2. Bump version in package.json
-3. Try again
+2. Check the run: `gh run list --workflow=release.yml --limit 1`
+3. If the version was never published, fix the mismatch, bump if needed, and push a new tag
 
 ### npm cache EACCES in sandboxed environments
 
@@ -765,7 +799,7 @@ Then configure DNS in Cloudflare dashboard.
 
 ### Q: Can multiple people use my deployment?
 
-Yes. Share your Workers URL with team members. Free tier supports 100k requests/day.
+Yes. Share your Workers URL with team members. The free tier supports 100k requests/day.
 
 ### Q: How do I update to a new version?
 
@@ -787,7 +821,7 @@ npm run deploy
 
 ## Next Steps
 
-- [ ] Test all 7 CKAN tools with your deployment
+- [ ] Test the tools with your deployment (`/health` reports the current counts — 20 tools, 7 resources, 6 prompts as of v0.4.120)
 - [ ] Configure Claude Desktop with Workers URL
 - [ ] Monitor usage in Cloudflare dashboard
 - [ ] Share endpoint with team members (optional)

@@ -4,8 +4,8 @@
 
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema, CkanPackage, CkanField } from "../types.js";
-import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, addDemoFooter } from "../utils/formatting.js";
+import { makeCkanRequest, formatCkanError } from "../utils/http.js";
+import { truncateText, truncateJson, addDemoFooter, formatError, sanitizeInline } from "../utils/formatting.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 interface CkanFieldWithInfo extends CkanField {
@@ -52,19 +52,19 @@ export function formatAnalyzeDatasetsMarkdown(
 
   for (const { dataset, datastoreResources, nonDatastoreResources } of datasets) {
     md += `---\n\n`;
-    md += `## ${dataset.title || dataset.name}\n\n`;
-    md += `- **ID**: \`${dataset.id}\`\n`;
-    md += `- **Name**: \`${dataset.name}\`\n`;
+    md += `## ${sanitizeInline(dataset.title || dataset.name)}\n\n`;
+    md += `- **ID**: \`${sanitizeInline(dataset.id)}\`\n`;
+    md += `- **Name**: \`${sanitizeInline(dataset.name)}\`\n`;
     if (dataset.organization) {
-      md += `- **Organization**: ${dataset.organization.title || dataset.organization.name}\n`;
+      md += `- **Organization**: ${sanitizeInline(dataset.organization.title || dataset.organization.name)}\n`;
     }
 
     if (datastoreResources.length > 0) {
       md += `\n### DataStore Resources\n\n`;
       for (const { resource, schema, error } of datastoreResources) {
-        md += `#### ${resource.name || resource.id}\n\n`;
-        md += `- **Resource ID**: \`${resource.id}\`\n`;
-        if (resource.format) md += `- **Format**: ${resource.format}\n`;
+        md += `#### ${sanitizeInline(resource.name || resource.id)}\n\n`;
+        md += `- **Resource ID**: \`${sanitizeInline(resource.id)}\`\n`;
+        if (resource.format) md += `- **Format**: ${sanitizeInline(resource.format)}\n`;
         if (error) {
           md += `- **Error**: ${error}\n`;
         } else if (schema) {
@@ -73,9 +73,9 @@ export function formatAnalyzeDatasetsMarkdown(
           if (fields.length > 0) {
             md += `\n**Fields** (${fields.length}):\n\n`;
             for (const f of fields) {
-              let line = `- \`${f.id}\` (${f.type})`;
-              if (f.info?.label) line += ` — ${f.info.label}`;
-              if (f.info?.notes) line += `: ${f.info.notes}`;
+              let line = `- \`${sanitizeInline(f.id)}\` (${sanitizeInline(f.type)})`;
+              if (f.info?.label) line += ` — ${sanitizeInline(f.info.label)}`;
+              if (f.info?.notes) line += `: ${sanitizeInline(f.info.notes)}`;
               md += line + '\n';
             }
           }
@@ -87,7 +87,7 @@ export function formatAnalyzeDatasetsMarkdown(
     if (nonDatastoreResources.length > 0) {
       md += `### Other Resources (not queryable)\n\n`;
       for (const r of nonDatastoreResources) {
-        md += `- ${r.name || '(unnamed)'}${r.format ? ` (${r.format})` : ''}\n`;
+        md += `- ${sanitizeInline(r.name || '(unnamed)')}${r.format ? ` (${sanitizeInline(r.format)})` : ''}\n`;
       }
       md += '\n';
     }
@@ -180,7 +180,7 @@ Typical workflow: ckan_analyze_datasets → ckan_datastore_search (with known fi
 
         if (params.response_format === ResponseFormat.JSON) {
           return {
-            content: [{ type: "text" as const, text: truncateText(JSON.stringify({ total: searchResult.count, datasets: analyzed }, null, 2)) }]
+            content: [{ type: "text" as const, text: truncateJson({ total: searchResult.count, datasets: analyzed }) }]
           };
         }
 
@@ -195,10 +195,7 @@ Typical workflow: ckan_analyze_datasets → ckan_datastore_search (with known fi
         };
       } catch (error) {
         return {
-          content: [{
-            type: "text" as const,
-            text: `Error analyzing datasets: ${error instanceof Error ? error.message : String(error)}`
-          }],
+          content: [{ type: "text" as const, text: formatError(formatCkanError(error, "ckan_analyze_datasets"), params.response_format === ResponseFormat.JSON) }],
           isError: true
         };
       }
@@ -227,7 +224,7 @@ export function formatCatalogStatsMarkdown(
     const sorted = Object.entries(values).sort((a, b) => b[1] - a[1]);
     md += `\n## ${label}\n\n`;
     for (const [name, count] of sorted) {
-      md += `- **${name}**: ${count}\n`;
+      md += `- **${sanitizeInline(name)}**: ${count}\n`;
     }
   }
 
@@ -279,7 +276,7 @@ Typical workflow: ckan_catalog_stats (understand the portal) → ckan_package_se
 
         if (params.response_format === ResponseFormat.JSON) {
           return {
-            content: [{ type: "text" as const, text: truncateText(JSON.stringify({ total: result.count, facets: result.facets }, null, 2)) }]
+            content: [{ type: "text" as const, text: truncateJson({ total: result.count, facets: result.facets }) }]
           };
         }
 
@@ -289,10 +286,7 @@ Typical workflow: ckan_catalog_stats (understand the portal) → ckan_package_se
         };
       } catch (error) {
         return {
-          content: [{
-            type: "text" as const,
-            text: `Error retrieving catalog stats: ${error instanceof Error ? error.message : String(error)}`
-          }],
+          content: [{ type: "text" as const, text: formatError(formatCkanError(error, "ckan_catalog_stats"), params.response_format === ResponseFormat.JSON) }],
           isError: true
         };
       }

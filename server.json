@@ -6,15 +6,23 @@
     "url": "https://github.com/ondata/ckan-mcp-server",
     "source": "github"
   },
-  "version": "0.4.83",
+  "version": "0.4.127",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@aborruso/ckan-mcp-server",
-      "version": "0.4.83",
+      "version": "0.4.127",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "CKAN_ALLOWED_DOMAINS",
+          "description": "Comma-separated CKAN hostnames to allow. Empty = any portal.",
+          "isRequired": false,
+          "placeholder": "www.dati.gov.it,open.canada.ca"
+        }
+      ]
     }
   ]
 }

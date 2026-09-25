@@ -10,6 +10,9 @@ dist/
 build/
 *.tsbuildinfo
 
+# Cloudflare Workers local state (miniflare state + temp bundles)
+.wrangler/
+
 # IDE
 .vscode/
 .idea/
@@ -30,6 +33,10 @@ Thumbs.db
 .mcp.json
 .claude/*.local.json
 .mcpregistry_*
+
+# prepack backup of the full README — left behind if a local publish fails
+# between prepack and postpack, must never be committed
+.readme-full.md
 
 # Logs
 logs/
@@ -60,6 +67,12 @@ testo.md
 # Docs proposals
 docs/proposte_agid.md
 docs/esempi.md
+docs/future-ideas.md
+# Security triage notes — references not-yet-public advisory detail; keep local
+docs/security-triage-next-steps.md
+
+# Local scratch
+.codex
 
 .gemini/
 gha-creds-*.json
@@ -78,3 +91,14 @@ __pycache__/
 
 cowork-plugin/ckan-mcp.plugin
 data/worker_events.jsonl
+
+# Local security mapping — contains a working repro, not for publication
+docs/untrusted-portal-strings-map.md
+.firecrawl/
+docs/internal/
+
+# Personal Claude Code tooling: the rules live in CLAUDE.md and scripts/, this is
+# only the local enforcement of them (see .claude/hooks/README.md)
+.claude/hooks/
+.claude/skills/release/
+.claude/skills/pr-review-loop/

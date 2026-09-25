@@ -1,8 +1,9 @@
 [![npm version](https://img.shields.io/npm/v/@aborruso/ckan-mcp-server)](https://www.npmjs.com/package/@aborruso/ckan-mcp-server)
 [![GitHub](https://img.shields.io/badge/github-ondata%2Fckan--mcp--server-blue?logo=github)](https://github.com/ondata/ckan-mcp-server)
-[![deepwiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ondata/ckan-mcp-server)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ondata/ckan-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Newsletter](https://img.shields.io/badge/newsletter-ondata-FF6719?logo=substack)](https://ondata.substack.com/)
+[![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
 
 # CKAN MCP Server AgID
 *repo fork del progetto di **[OnData](https://github.com/ondata/ckan-mcp-server)** a servizio del Connettore MCP-CKAN su CloudFlare*
@@ -65,13 +66,15 @@ CKAN is the open-source platform behind most public open data portals worldwide 
 
 **Who is this for?** Everyone. Journalists looking for data to verify a story. Researchers exploring public datasets. Public servants checking what data their administration publishes. Developers building data pipelines. No CKAN knowledge required.
 
+> **Adopted by AgID** — This project has been [reused by AgID](https://github.com/agID/ckan-mcp-server), Italy's Agency for Digital Italy, as part of its effort to make public open data more accessible, immediate, and easier to consult through AI.
+
 **Two ways to use it — pick the one that suits you:**
 
 | | Option A: Install locally | Option B: No install |
 |---|---|---|
 | **How** | `npm install -g @aborruso/ckan-mcp-server` | Point your tool to the hosted HTTP endpoint |
 | **Best for** | Runs on your machine, works with any local tool | Quick start, zero setup |
-| **Limits** | None | 100k requests/day shared quota |
+| **Request quota** | No shared quota | 100k requests/day shared quota |
 
 Hosted endpoint: `https://ckan-mcp-server.agid.workers.dev/mcp`
 
@@ -82,6 +85,26 @@ Hosted endpoint: `https://ckan-mcp-server.agid.workers.dev/mcp`
 **License**: MIT — see [LICENSE](LICENSE) for complete details. Third-party notices: [NOTICE.md](NOTICE.md).
 
 ![CKAN MCP Server demo](docs/guide/mcp_server_demo.gif)
+
+---
+
+## ⚖️ Limits
+
+The local and hosted server use the same tool and output caps. The hosted endpoint also has the shared request quota shown above.
+
+| Area | Default | Maximum or configuration |
+|---|---:|---|
+| Tool output | 50,000 characters | Fixed server-wide cap |
+| `ckan_datastore_search` rows | 100 | 32,000 (`0` returns column names only) |
+| `ckan_package_search` results per page | 10 | 1,000 |
+| `ckan_find_relevant_datasets` results | 10 | 50 |
+| Injected `sparql_query` rows | 25 | 1,000 when injected; a query that supplies its own `LIMIT` is not capped |
+| `ckan_tag_list` results | 100 | 1,000 |
+| `ckan_find_portals` results | 10 | 50 |
+| HTTP response body | 32 MiB | `CKAN_MAX_RESPONSE_BYTES` for local Node.js deployments |
+| Decompressed response body | 64 MiB | `CKAN_MAX_DECOMPRESSED_BYTES` for local Node.js deployments |
+
+Text and Markdown responses that exceed the output cap are cut and include a truncation note. JSON responses stay parseable: the server reduces known result arrays and flags the response with `_truncated` and `_original_count`, and if a response still cannot fit it is replaced by a small object carrying `_truncated` and an explanatory `_error`. The same capped payload is sent on both channels, so a client reading `structuredContent` sees exactly what the text shows, truncation flags included. Use pagination or a narrower query when you need the complete result set.
 
 ---
 
@@ -346,8 +369,8 @@ The MCP server will be available at `http://localhost:3000/mcp`. See [`docker/RE
 
 ### Quality Metrics
 
-- **ckan_get_mqa_quality**: Get MQA quality score and metrics for dati.gov.it datasets (accessibility, reusability, interoperability, findability)
-- **ckan_get_mqa_quality_details**: Get detailed MQA quality reasons and failing flags for dati.gov.it datasets
+- **ckan_get_mqa_quality**: Get the MQA quality score (methodology v2, 0-7.5 scale with band) for dati.gov.it datasets, with the failing metrics that would raise it most
+- **ckan_get_mqa_quality_details**: List every failing MQA metric for dati.gov.it datasets, grouped by FAIR dimension, with DCAT-AP property, weight and gain
 
 ### Portal Discovery
 
@@ -560,11 +583,12 @@ npx skills add ondata/ckan-mcp-server --skill ckan-mcp
 Some examples of supported portals:
 
 - 🇮🇹 **https://www.dati.gov.it/opendata** - Italian National Open Data Portal (CKAN 2.10.3)
-- 🇺🇸 **https://catalog.data.gov** - United States Open Data (CKAN 2.11.4)
 - 🇨🇦 **https://open.canada.ca/data** - Canada Open Government (CKAN 2.10.8)
 - 🇦🇺 **https://data.gov.au** - Australian Government Open Data (CKAN 2.11.4)
 - 🇬🇧 **https://data.gov.uk** - United Kingdom Open Data
 - And many more portals worldwide
+
+> **catalog.data.gov is no longer CKAN.** Data.gov replaced its catalog in 2025 with a different API ([details](https://github.com/ondata/ckan-mcp-server/issues/540)); a call to it now explains this instead of failing with a bare 404.
 
 ### Discover CKAN portals worldwide
 
@@ -875,11 +899,34 @@ npx @modelcontextprotocol/inspector node dist/index.js
 
 Opens at `http://localhost:5173`.
 
+### Security: HTTP transport requires a domain allowlist
+
+The HTTP transport (`TRANSPORT=http`) is **unauthenticated**: any client that reaches
+`POST /mcp` can drive requests through it. Since v0.4.109 it **binds to `127.0.0.1`
+(loopback) by default** and enforces DNS-rebinding protection, so it is not exposed on
+the LAN and cross-origin browser requests are rejected. To prevent SSRF abuse (e.g. a
+caller pointing `server_url` at internal hosts or cloud metadata), it also **refuses to
+start** unless you set a domain allowlist:
+
+| Variable | Effect |
+|---|---|
+| `CKAN_ALLOWED_DOMAINS` | Comma-separated allowlist of hostnames the server may query (default-deny). **Required** to start the HTTP transport. Example: `CKAN_ALLOWED_DOMAINS="www.dati.gov.it,dati.comune.messina.it"` |
+| `CKAN_HTTP_ALLOW_ALL=true` | Explicit opt-out: start the HTTP transport **without** an allowlist (logs a security warning). Not recommended when network-exposed. |
+| `CKAN_HTTP_HOST` | Interface to bind (default `127.0.0.1`). Set `0.0.0.0` to expose it, ideally behind an authenticating reverse proxy. |
+| `CKAN_HTTP_ALLOWED_HOSTS` | Extra `Host` header values accepted by the DNS-rebinding guard (comma-separated). Add your public hostname when binding beyond loopback. |
+| `CKAN_HTTP_ALLOWED_ORIGINS` | Allowed `Origin` header values for browser clients (comma-separated). |
+
+The default `stdio` transport is unaffected — it stays open so you can query any portal
+locally. Regardless of allowlist, all requests are also validated against private/internal
+IP ranges, including hostnames that *resolve* to internal addresses (DNS-based SSRF, fixed
+in v0.4.108). The official Cloudflare Worker is sandboxed by the platform and does not
+require this setting.
+
 ### Manual HTTP Testing
 
 ```bash
-# Start server
-TRANSPORT=http PORT=3001 node dist/index.js
+# Start server (HTTP needs an allowlist — see "Security" above)
+CKAN_ALLOWED_DOMAINS="www.dati.gov.it" TRANSPORT=http PORT=3001 node dist/index.js
 
 # List available tools
 curl -s -X POST http://localhost:3001/mcp \
@@ -946,6 +993,14 @@ For issues or questions, [open an issue on GitHub](https://github.com/ondata/cka
 This server collects no personal data. It is read-only and stateless — queries are forwarded directly to the public CKAN API you specify, and no data is stored or logged.
 
 See the full [Privacy Policy](https://github.com/ondata/ckan-mcp-server/blob/main/PRIVACY.md).
+
+---
+
+## Related tools
+
+- **[opensituas](https://github.com/ondata/opensituas)** — Codes and history of every Italian territorial unit, from the CLI. The join key for any ISTAT dataset.
+- **[opensdmx](https://github.com/ondata/opensdmx)** — Official statistics from Eurostat, ISTAT, OECD, and other SDMX providers — no hallucinations, only published figures.
+- **[ISTAT MCP Server](https://github.com/ondata/istat_mcp_server)** — Italian statistical data directly in your AI assistant, via the MCP protocol.
 
 ---
 
