@@ -4,7 +4,10 @@ import {
   escapeRegExp,
   textMatchesTerms,
   scoreTextField,
-  scoreDatasetRelevance
+  countMatchingTerms,
+  stemTerm,
+  scoreDatasetRelevance,
+  readDcatExtra
 } from '../../src/tools/package';
 
 describe('extractQueryTerms', () => {
@@ -263,7 +266,9 @@ describe('scoreDatasetRelevance', () => {
         result.breakdown.title +
         result.breakdown.notes +
         result.breakdown.tags +
-        result.breakdown.organization
+        result.breakdown.organization +
+        result.breakdown.holder +
+        result.breakdown.publisher
       );
     });
 
@@ -287,7 +292,7 @@ describe('scoreDatasetRelevance', () => {
         tags: [],
         organization: null
       };
-      const weights = { title: 10, notes: 5, tags: 3, organization: 1 };
+      const weights = { title: 10, notes: 5, tags: 3, organization: 1, holder: 4, publisher: 2 };
       const result = scoreDatasetRelevance('health', dataset, weights);
 
       expect(result.breakdown.title).toBe(10);
@@ -379,6 +384,8 @@ describe('scoreDatasetRelevance', () => {
       expect(result.breakdown).toHaveProperty('notes');
       expect(result.breakdown).toHaveProperty('tags');
       expect(result.breakdown).toHaveProperty('organization');
+      expect(result.breakdown).toHaveProperty('holder');
+      expect(result.breakdown).toHaveProperty('publisher');
     });
 
     it('includes extracted terms in result', () => {
@@ -389,5 +396,319 @@ describe('scoreDatasetRelevance', () => {
       expect(result.terms).toContain('data');
       expect(result.terms).toContain('portal');
     });
+  });
+});
+
+describe('readDcatExtra', () => {
+  it('returns extras value when key is present', () => {
+    const dataset = {
+      extras: [
+        { key: 'holder_name', value: 'Comune di Lecce' }
+      ]
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('Comune di Lecce');
+  });
+
+  it('prefers extras over root field when both are present', () => {
+    const dataset = {
+      holder_name: 'Regione Puglia',
+      extras: [
+        { key: 'holder_name', value: 'Comune di Lecce' }
+      ]
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('Comune di Lecce');
+  });
+
+  it('falls back to root field when key not in extras', () => {
+    const dataset = {
+      holder_name: 'Health Canada',
+      extras: [
+        { key: 'other_field', value: 'something' }
+      ]
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('Health Canada');
+  });
+
+  it('falls back to root field when extras is empty', () => {
+    const dataset = {
+      holder_name: 'data.gov',
+      extras: []
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('data.gov');
+  });
+
+  it('falls back to root field when extras is absent', () => {
+    const dataset = {
+      publisher_name: 'Open Government'
+    };
+    expect(readDcatExtra(dataset, 'publisher_name')).toBe('Open Government');
+  });
+
+  it('returns empty string when neither extras nor root have the key', () => {
+    const dataset = {
+      extras: [{ key: 'other', value: 'x' }]
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('');
+  });
+
+  it('returns empty string for completely empty dataset', () => {
+    const dataset = {};
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('');
+  });
+
+  it('skips extras entry with empty string value', () => {
+    const dataset = {
+      holder_name: 'Root Value',
+      extras: [
+        { key: 'holder_name', value: '' }
+      ]
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('Root Value');
+  });
+
+  it('skips extras entry with non-string value', () => {
+    const dataset = {
+      holder_name: 'Root Value',
+      extras: [
+        { key: 'holder_name', value: 42 }
+      ]
+    };
+    expect(readDcatExtra(dataset, 'holder_name')).toBe('Root Value');
+  });
+
+  it('handles publisher_name key', () => {
+    const dataset = {
+      publisher_name: 'Root Publisher',
+      extras: [
+        { key: 'publisher_name', value: 'Extras Publisher' }
+      ]
+    };
+    expect(readDcatExtra(dataset, 'publisher_name')).toBe('Extras Publisher');
+  });
+});
+
+describe('scoreDatasetRelevance — holder and publisher', () => {
+  it('scores holder from extras (DCAT-AP_IT pattern)', () => {
+    const dataset = {
+      title: 'Defibrillatori DAE',
+      organization: { name: 'regione-puglia', title: 'Regione Puglia' },
+      extras: [{ key: 'holder_name', value: 'Comune di Lecce' }]
+    };
+    const result = scoreDatasetRelevance('Comune di Lecce', dataset);
+
+    expect(result.breakdown.holder).toBeGreaterThan(0);
+    expect(result.breakdown.organization).toBe(0);
+  });
+
+  it('extras holder wins over root holder when they differ (federated portal fix)', () => {
+    const dataset = {
+      title: 'Dataset',
+      holder_name: 'Regione Puglia',
+      extras: [{ key: 'holder_name', value: 'Comune di Mesagne' }]
+    };
+    const withFix = scoreDatasetRelevance('Mesagne', dataset);
+    expect(withFix.breakdown.holder).toBeGreaterThan(0);
+
+    const datasetRootOnly = {
+      title: 'Dataset',
+      holder_name: 'Comune di Mesagne'
+    };
+    const withRoot = scoreDatasetRelevance('Mesagne', datasetRootOnly);
+    expect(withRoot.breakdown.holder).toBeGreaterThan(0);
+  });
+
+  it('scores publisher from extras', () => {
+    const dataset = {
+      title: 'Dataset',
+      extras: [{ key: 'publisher_name', value: 'Regione Siciliana' }]
+    };
+    const result = scoreDatasetRelevance('Siciliana', dataset);
+
+    expect(result.breakdown.publisher).toBeGreaterThan(0);
+  });
+
+  it('holder and publisher contribute to total', () => {
+    const dataset = {
+      title: 'Dataset',
+      extras: [
+        { key: 'holder_name', value: 'Comune di Lecce' },
+        { key: 'publisher_name', value: 'Comune di Lecce' }
+      ]
+    };
+    const result = scoreDatasetRelevance('Lecce', dataset);
+
+    expect(result.breakdown.holder).toBeGreaterThan(0);
+    expect(result.breakdown.publisher).toBeGreaterThan(0);
+    expect(result.total).toBe(
+      result.breakdown.title +
+      result.breakdown.notes +
+      result.breakdown.tags +
+      result.breakdown.organization +
+      result.breakdown.holder +
+      result.breakdown.publisher
+    );
+  });
+
+  it('non-DCAT portal: holder and publisher score 0 when fields absent', () => {
+    const dataset = {
+      title: 'Health Dataset',
+      organization: { name: 'health-canada', title: 'Health Canada' }
+    };
+    const result = scoreDatasetRelevance('health', dataset);
+
+    expect(result.breakdown.holder).toBe(0);
+    expect(result.breakdown.publisher).toBe(0);
+  });
+
+  it('uses default weight 4 for holder', () => {
+    const dataset = {
+      title: 'Data',
+      extras: [{ key: 'holder_name', value: 'Comune di Lecce' }]
+    };
+    const result = scoreDatasetRelevance('Lecce', dataset);
+
+    expect(result.breakdown.holder).toBe(4);
+  });
+
+  it('uses default weight 2 for publisher', () => {
+    const dataset = {
+      title: 'Data',
+      extras: [{ key: 'publisher_name', value: 'Comune di Lecce' }]
+    };
+    const result = scoreDatasetRelevance('Lecce', dataset);
+
+    expect(result.breakdown.publisher).toBe(2);
+  });
+});
+
+describe('relevance dilution (regression from v0.4.122)', () => {
+  it('drops Italian stopwords, which used to carry a whole field', () => {
+    // `di` matched "Provincia Autonoma di Trento" and awarded the full holder
+    // weight on a query asking for Lecce.
+    expect(extractQueryTerms('defibrillatori Comune di Lecce')).toEqual([
+      'defibrillatori',
+      'comune',
+      'lecce'
+    ]);
+    expect(extractQueryTerms('elenco dei siti della regione')).toEqual([
+      'elenco',
+      'siti',
+      'regione'
+    ]);
+  });
+
+  it('scores a field by the share of terms it carries', () => {
+    const terms = ['defibrillatori', 'comune', 'lecce'];
+    expect(scoreTextField('Comune di Lecce', terms, 4)).toBe(2.7);
+    expect(scoreTextField('Comune di Martina Franca', terms, 4)).toBe(1.3);
+    expect(scoreTextField('Provincia Autonoma di Trento', terms, 4)).toBe(0);
+  });
+
+  it('still gives the full weight when every term matches', () => {
+    expect(scoreTextField('health data portal', ['health'], 5)).toBe(5);
+    expect(scoreTextField('mobilità urbana', ['mobilità', 'urbana'], 6)).toBe(6);
+  });
+
+  it('matches a term ending in an accented letter', () => {
+    // `\\b` is ASCII-only in JavaScript, so `mobilità` never found its boundary and
+    // scored 0 on a catalog that is mostly not in English.
+    expect(countMatchingTerms('mobilità urbana', ['mobilità'])).toBe(1);
+    expect(countMatchingTerms('qualità dell aria', ['qualità'])).toBe(1);
+    expect(countMatchingTerms('città metropolitana', ['città'])).toBe(1);
+    // and still respects boundaries
+    expect(countMatchingTerms('immobilità', ['mobilità'])).toBe(0);
+  });
+
+  it('counts matching terms without double counting', () => {
+    expect(countMatchingTerms('comune di lecce, comune', ['comune', 'lecce'])).toBe(2);
+    expect(countMatchingTerms(undefined, ['comune'])).toBe(0);
+    expect(countMatchingTerms('comune', [])).toBe(0);
+  });
+});
+
+describe('multilingual term extraction', () => {
+  it('keeps an all-caps acronym that collides with a stopword', () => {
+    // `un` is an Italian article and the United Nations: dropping it would rank
+    // `UN population` on `population` alone.
+    expect(extractQueryTerms('UN population')).toEqual(['un', 'population']);
+    expect(extractQueryTerms('EU open data')).toContain('eu');
+  });
+
+  it('still drops the lowercase article', () => {
+    expect(extractQueryTerms('un comune di lecce')).toEqual(['comune', 'lecce']);
+  });
+
+  it('never scores on a Solr operator, even though it is all-caps', () => {
+    // The acronym rule let `OR` through: `aria OR acqua` scored on three terms and
+    // a title carrying one of them got 4 × 1/3 instead of 4 × 1/2.
+    expect(extractQueryTerms('aria OR acqua')).toEqual(['aria', 'acqua']);
+    expect(extractQueryTerms('aria AND NOT rifiuti')).toEqual(['aria', 'rifiuti']);
+    // lowercase `or` was already a stopword; an English `Or` mid-sentence stays one too
+    expect(extractQueryTerms('water or sewage')).toEqual(['water', 'sewage']);
+  });
+
+  it('keeps a quoted operator: inside quotes Solr reads it as a literal', () => {
+    expect(extractQueryTerms('"OR" Oregon')).toEqual(['or', 'oregon']);
+    expect(extractQueryTerms('aria OR "AND"')).toEqual(['aria', 'and']);
+    // an escaped quote inside the phrase does not end it
+    expect(extractQueryTerms('"OR\\" AND" acqua')).toEqual(['or', 'and', 'acqua']);
+  });
+
+  it('matches across Unicode normal forms', () => {
+    const nfd = 'mobilita\u0300 urbana';          // decomposed
+    expect(countMatchingTerms(nfd, ['mobilità'])).toBe(1);
+    expect(extractQueryTerms('mobilita\u0300')).toEqual(['mobilità'.normalize('NFC')]);
+  });
+});
+
+describe('score total', () => {
+  it('does not leak binary-float noise into the output', () => {
+    // A real result printed as 8.299999999999999 before rounding the sum.
+    const dataset = {
+      title: 'Sinistri stradali rilevati nel territorio comunale',
+      notes: 'incidenti a Palermo',
+      tags: [{ name: 'incidenti' }],
+      organization: { title: 'Comune di Palermo' }
+    } as any;
+    const { total } = scoreDatasetRelevance('incidenti stradali Palermo', dataset);
+    expect(total).toBe(Math.round(total * 10) / 10);
+  });
+});
+
+describe('stemming (#539)', () => {
+  it('strips one final vowel from words of five letters or more', () => {
+    expect(stemTerm('defibrillatori')).toBe('defibrillator');
+    expect(stemTerm('defibrillatore')).toBe('defibrillator');
+    expect(stemTerm('qualità')).toBe('qualit');
+    expect(stemTerm('qualita')).toBe('qualit');
+    expect(stemTerm('aria')).toBe('aria');
+  });
+
+  it('lets singular and plural match, which cost the Lecce dataset its tag score', () => {
+    expect(countMatchingTerms('dae defibrillatore comune-cardioprotetto', ['defibrillatori'])).toBe(1);
+    expect(countMatchingTerms('qualita-aria', ['qualità'])).toBe(1);
+    expect(countMatchingTerms('Milan observatory', ['milano'])).toBe(1);
+  });
+
+  it('still compares whole words', () => {
+    expect(countMatchingTerms('immobilità', ['mobilità'])).toBe(0);
+    expect(countMatchingTerms('aria', ['arie'])).toBe(0);
+  });
+
+  it('drops elided articles', () => {
+    expect(extractQueryTerms("qualità dell'aria Milano")).toEqual(['qualità', 'aria', 'milano']);
+    expect(extractQueryTerms("dati sull'acqua nell'area")).toEqual(['dati', 'acqua', 'area']);
+  });
+});
+
+describe('coverage bonus (#539)', () => {
+  const dataset = { title: 'Defibrillatori DAE', notes: '', tags: [] } as any;
+
+  it('adds the coverage weight when the portal returned the dataset with every term', () => {
+    const plain = scoreDatasetRelevance('defibrillatori Lecce', dataset);
+    const full = scoreDatasetRelevance('defibrillatori Lecce', dataset, undefined, true);
+    expect(plain.breakdown.coverage).toBe(0);
+    expect(full.breakdown.coverage).toBe(4);
+    expect(full.total - plain.total).toBe(4);
   });
 });

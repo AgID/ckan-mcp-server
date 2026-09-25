@@ -1,5 +1,631 @@
 # LOG
 
+## 2026-09-24
+
+### v0.4.127
+
+Ships #554: `dct:temporal` coverage in `ckan_package_show` (markdown + JSON, every period, `start_equals_issued` flag) and `CKAN_ALLOWED_DOMAINS` declared optional in `server.json` for the MCP Registry. Smoke 17/17.
+
+### `ckan_package_show`: temporal coverage (dct:temporal)
+
+New `readTemporalCoverage()` reads `dct:temporal` in both shapes dati.gov.it uses: root `temporal_coverage` (JSON string, e.g. Comune di Coriano) and extras `temporal_start`/`temporal_end`/`temporal_coverage` (Regione Toscana, 12,426 datasets). Rendered as **Temporal Coverage (dct:temporal)** in markdown and `temporal_coverage: [{start, end, start_equals_issued}]` in JSON, every period kept; before, JSON had nothing and markdown only the extras case. `start_equals_issued` is a factual flag for start = issued with no end: a full scan of the 17,860 datasets with `temporal_start` found a third like that, and on the origin portals (dati.toscana.it, opendata.maggioli.cloud, opendata.uniba.it, all dcatapit) `temporal_coverage` is empty in the CKAN API while their RDF export emits `dct:temporal` with `startDate` = `dct:issued`. So it is an export artefact, not a publisher entry. INPS, MIT, LaMMA weather runs and Camera di Commercio Marche carry real spans.
+
+### server.json: declare `CKAN_ALLOWED_DOMAINS` as optional
+
+Claude Desktop's configure dialog asked for six env vars, `CKAN_ALLOWED_DOMAINS` marked required, inferred from the README HTTP table. The registry package is stdio, where the allowlist is optional. `server.json` now declares the one variable explicitly (`isRequired: false`, placeholder). Takes effect on the next registry publish.
+
+## 2026-09-23
+
+### v0.4.126 - why MQA URL tests fail
+
+Ships #552. For a caller: `ckan_get_mqa_quality_details` now says why URL tests fail (`HTTP test: 1100 timeout ×21, no status recorded ×3`). For the project: `npm run smoke` checks the MQA tool live against data.europa.eu, so a format change there fails the release gate.
+
+### MQA: smoke gate and HTTP status of failing URL tests
+
+- `npm run smoke` gains a live MQA case (Roma `czrm-…-2023`: `methodology` v2, `maxScore` 7.5, 0 ≤ `score` ≤ 7.5) and a generic `field_max`. v0.4.124 shipped broken MQA tools with green tests because the tests read stored fixtures; the gate now asks data.europa.eu. Negative check: expecting `v1` fails the case.
+- `ckan_get_mqa_quality_details` says why URL tests fail: `HTTP test: 1100 timeout ×21, no status recorded ×3`. Codes come from the metrics graph (`http:statusCodeValue` in v2, `dqv:value` in v1; ≥1000 are piveau's own, 1100 = timeout), latest per distribution, 2xx excluded. Fetched only by the details tool and only when a URL test fails (the graph is ~570 KB); best effort, a failed fetch leaves the details intact.
+- Bug caught by the tests: boolean result nodes share the metric id, and `Number(false)` read as status code 0.
+
+### v0.4.125 - MQA scores on the new data.europa.eu methodology
+
+Ships #549 (closes #548). For a caller: `ckan_get_mqa_quality` and `ckan_get_mqa_quality_details` report the MQA v2 score (0-7.5, band, failing metrics by gain) instead of printing v2 numbers on the old 405 scale or failing with "identifier not aligned"; datasets not yet re-evaluated get the previous-methodology score, labelled. The MQA tools work again on the Cloudflare Worker. **BREAKING** for JSON consumers of the two MQA tools: compact shape with `methodology`, `metricsVersion`, `score`, `maxScore`.
+
+### MQA tools follow the data.europa.eu methodology v2 (#548)
+
+- data.europa.eu switched the MQA to a new methodology (DCAT-AP 3, weights 1/0.5/0.25, 0-7.5 scale, four FAIR dimensions, no Contextuality, SHACL not scored). The dataset cache now serves only v2 and answers `404 No v2 metrics found` for datasets not yet re-evaluated: on day one, 1,051 of 61,897 dati.gov.it datasets.
+- Both MQA tools were broken: re-evaluated datasets printed `6.5/405` and `Accessibility 2.25/100`, the JSON of a 24-distribution dataset exceeded 50k and came back `{_truncated}`; the others failed with a wrong "identifier not aligned" error.
+- Now: v2 payload parsed directly — `datasetFinal`/7.5 with band, dataset/distribution/data service scores, failing metrics aggregated across distributions ("21 of 24") and ordered by their exact gain on the final score. Checked live: score + sum of gains = 7.5.
+- `result: null` (test not run, e.g. no URL) counts as failing, as it does in the official score; found only on the live payload.
+- No v2 yet → previous-methodology scores from the metrics endpoint, labelled; refused if the graph already carries v2-scale numbers.
+- MQA tools were already broken on the Worker (`The 'cache' field on 'RequestInitializerDict' is not implemented`, axios fetch adapter): the cache call now goes through `safeFetch` like the metrics call. Verified with `wrangler dev` and the Node HTTP server.
+- `DQV of dataset not found` and `No v2 metrics found` now give different errors. JSON output is compact (`methodology`, `metricsVersion`, `maxScore`), never the raw payload. OpenSpec change `update-mqa-methodology-v2`.
+
+## 2026-09-06
+
+### v0.4.124 - search that answers the question that was asked
+
+Ships #542, #543, #544 and #545. For a caller: a query naming a place or an organisation
+now returns that place's datasets instead of any dataset on the topic; `catalog.data.gov`
+says where its data went instead of failing with "Unknown error"; `OR`, `AND` and `NOT`
+are treated as operators rather than words to score.
+
+### Two gate cases for the strict pass, and one that was passing for free
+
+The `mm=100%` pass added in #544 was verified by hand, so nothing stopped it from
+regressing. Two cases now cover it: a boolean query must skip the strict pass
+(`all_terms_results: null`), and a query no dataset satisfies in full must still be
+answered by the fill pass (`all_terms_results: 0`, results returned).
+
+Checking that they fail on the defects they name — which is the point of this file —
+found that the second one did not. It asserted `total_results` and `all_terms_results`
+but never that any result came back, so a build where the strict pass emptied the answer
+passed it. `returned_min` was added: a tool can report thousands of matches and hand back
+an empty list, and those are different claims. Both cases now fail on the broken build and
+pass on the fixed one.
+
+Also added `field_equals`, an exact check on any payload field, and `field_min`, a floor.
+The split came from review: pinning the Milano case at exactly 327 matching datasets broke
+the file's own rule that thresholds survive catalog drift, so counts that track the catalog
+are floors now, while `null` and `0` stay equalities — they are behaviours, not counts.
+`field_equals` also requires the field to be present, or a response that stopped emitting
+`all_terms_results` would read as an explicit null and pass.
+
+16 cases, 16 passing.
+
+### #539: the window is the lever, not the score
+
+The issue proposed IDF for the tie at 9.7 on `defibrillatori Comune di Lecce`. Prototyped
+on the real 50 candidates the tool fetches, IDF alone makes it worse — the Lecce dataset
+drops out of the top three, since `lecce` is rarer than `comune` in that set and the
+"patrocini" datasets carry it in every field. Two other things do the work, and both are
+smaller than a ranking model:
+
+- `mm=100%`. It is on CKAN's `VALID_SOLR_PARAMETERS` and works on every portal tried
+  (dati.gov.it, Milano, Toronto, Zurigo); with a wrapped query it is ignored without error.
+  It asks Solr for datasets carrying every term, matched with Solr's own stemming across
+  `qf`, and changes the candidate window itself: the Lecce query returns exactly one
+  dataset; `qualità dell'aria Milano`, whose default top 50 contained no Milan dataset at
+  all, returns the Comune di Milano reports first; `incidenti stradali Palermo` returns 20,
+  all Palermo. The strict pass runs first and the default pass fills in when it is short;
+  strict candidates earn a `coverage` bonus (weight 4) shown in the breakdown.
+- light stemming in the local matcher: `defibrillatore` in the tag and `defibrillatori` in
+  the query were strangers to the whole-word regex, and that tag score was the whole
+  difference. One final vowel stripped from words of five letters or more, whole-word
+  comparison kept. Elided articles (`dell'aria` → `dell`) join the stopwords.
+
+Native dati.gov.it API against the MCP server, same text:
+
+| query | native API, top 3 | MCP `find_relevant_datasets`, top 3 |
+|---|---|---|
+| defibrillatori Comune di Lecce | Mussolente, Desio, Lecce (679) | **Lecce 14.4**, then patrocini 9.7 |
+| qualità dell'aria Milano | Marche, Campania, Sicilia (2401) | three Comune di Milano reports (327 with every term) |
+| incidenti stradali Palermo | Lombardia, Palermo, Lombardia (320) | three Comune di Palermo datasets (20 with every term) |
+| aria OR acqua (Milano) | 0 — dismax swallows the OR | 87, sent as `text:(aria OR acqua)` |
+
+Cost: one extra call per ranked search, the strict pass; the default pass still runs so
+`total_results` keeps its meaning, as a `rows=0` count when the strict pass already filled
+the limit. Boolean and fielded queries make one call, as before. A portal that rejects
+`mm` falls back to the default pass alone. The gate asserts terms and margin now (`terms_equal`, `margin_min`): Lecce leads
+by ≥ 2 with terms `[defibrillatori, comune, lecce]`, and the Milano case requires a Comune
+di Milano report first. 550 tests, 14/14 smoke. OpenSpec change `rank-on-full-coverage`.
+
+### catalog.data.gov has not been CKAN since 2025; we said otherwise in twelve places
+
+Checking the two configured portals that answered nothing yesterday. `dati.arpae.it` is
+still CKAN and still at the same address, just down most of the time — site-wide 500s,
+not ours to fix (#541). `catalog.data.gov` is a different story: Data.gov replaced its
+CKAN catalog with a Flask/OpenSearch application in 2025 and the CKAN-compatible
+endpoints — `catalog-old.data.gov`, the `api.gsa.gov/…/v3` gateway — now all redirect to
+the new host, which answers 404 to any CKAN request. The replacement API (`…/v4/search`)
+needs a key, paginates with a cursor and, per GSA, will not support CKAN filter syntax.
+47 calls reached it through the public deployment since April and got
+`CKAN API error (404): Unknown error`, while README, EXAMPLES, CLAUDE.md, the skill and a
+tool description all listed it as a working CKAN portal (#540).
+
+Fixed the part that is ours: `portals.json` entries can carry a `migrated` block, the
+`catalog-data-gov` entry is kept and marked so the hint keeps firing, `CkanApiError` now
+carries the portal URL, and `formatCkanError` returns the migration notice for such a
+portal whatever the status — no status-based hint can be right for it. `ckan_status_show`
+routes its error through the formatter too. Every document that presented it as CKAN now
+says the opposite; the skill's country table says "NOT CKAN since 2025", which is what
+stops an LLM client from trying. A v4 adapter is a separate proposal.
+
+The gate gained a case that calls the live portal and expects the notice; 13/13.
+OpenSpec change `mark-migrated-portals` on `ckan-error-hints`. 542 tests, 6 added.
+
+Left alone: `docs/DECISIONS.md` still describes the parser probe replaced in #534 and says
+configured portals skip it. Stale independently of this change; flagged, not touched.
+
+## 2026-09-05
+
+### A release gate that asserts which dataset comes back
+
+Three releases went out today, two of them to repair the one before. The verification in
+between was a sequence of commands rebuilt from memory each time, so it covered something
+different on each pass — and what it always covered was result counts. v0.4.122 shipped
+with counts verified and the ranking broken, because "22 results" and "the right dataset
+first" are different claims and only the second is what a caller asked for.
+
+`npm run smoke` is that check as a command. Twelve known-answer cases from real telemetry
+in `tests/smoke/cases.json`, each asserting which dataset must come back and carrying the
+regression it guards; the runner starts the built server over HTTP, calls each tool the
+way a client does, and exits non-zero on the first failure.
+
+Checked against the defects it claims to catch: reintroducing the v0.4.121 wrapping rule
+fails 4 of 12, and removing the parser probe from `ckan_find_relevant_datasets` — the
+v0.4.122 regression — fails the case requiring the two search tools to agree. Wired into
+the release workflow in `CLAUDE.md` (step 2, before the tag) and the checklist in
+`docs/DEPLOYMENT.md`.
+
+Two things the gate needed on the way:
+
+- the JSON format never exposed the query that actually ran, while Markdown has always
+  shown it. `effective_query` now appears in `ckan_package_search` JSON output when the
+  server rewrote the query, and is absent when it did not.
+- relevance scores summed unrounded fractions, printing totals like `8.299999999999999`.
+
+Known and not fixed: the ranking model weights every query term equally, so on
+`defibrillatori Comune di Lecce` three datasets tie at 9.7 and the right one leads on
+Solr order rather than on score. Making the `tags` field proportional like the others was
+tried and reverted — it promotes "Elenco patrocini Comune di Lecce", whose tags carry two
+of the three terms against the defibrillator dataset's one. The fix is term specificity,
+a design change, not a patch.
+
+### v0.4.123 - relevance scoring and shared parser probe
+
+Ships #536: field scoring by share of matched terms, Italian stopwords with acronyms preserved, Unicode-aware term matching, a wider candidate window, the parser probe shared with `ckan_find_relevant_datasets`, and accent-safe filters in `ckan_organization_search` and `ckan_tag_list`. `openspec/specs/ckan-search/spec.md` rewritten around the query-building path.
+
+### Relevance scoring: three defects that only became visible once search worked
+
+Testing v0.4.122 through an MCP client, not curl, showed `ckan_find_relevant_datasets`
+answering its own documented example badly. `defibrillatori Comune di Lecce` on
+dati.gov.it used to return the catalog's only Lecce dataset — because the search
+returned exactly one result. With recall restored it returns 679, and the top three
+became Trento, Martina Franca and Desio while the Lecce dataset fell out of the window.
+
+The wrapping fix did not cause this; it removed the cover. Three defects, all older:
+
+- `scoreTextField` awarded the **whole** field weight when **any** query term matched.
+  "Comune di Martina Franca" and "Comune di Lecce" both scored a full holder match, so
+  the right dataset could not outrank the wrong ones. It now scores the share of terms
+  the field carries.
+- the stopword list was English-only, so `di` counted as a term: "Provincia Autonoma
+  **di** Trento" earned a full holder match on a query asking for Lecce. Italian
+  stopwords added.
+- `\b` is ASCII-only in JavaScript, so a term ending in an accented letter never found
+  its word boundary: `mobilità` scored 0 against "mobilità urbana", `qualità` against
+  "qualità dell'aria". On a catalog that is mostly not in English this silently sank
+  every accented query. Replaced with Unicode lookarounds.
+
+Looking for more of the same family turned up three more, all cases of a local filter
+running over a truncated or wrongly-normalised set:
+
+- `ckan_find_relevant_datasets` never called the parser probe. `portals.json` used to
+  cover it; removing `force_text_field` left it sending boolean queries to the parser that
+  ignores them. On dati.comune.milano.it `aria OR acqua` returned 0 there against 87 from
+  `ckan_package_search`. Same probe now applies to both.
+- `ckan_organization_search` builds a Solr wildcard, which bypasses the analysis chain, so
+  the pattern must be pre-normalised the way CKAN builds a name slug. It lowercased but did
+  not fold accents: `città` returned 0 while `citta` matched 135 datasets.
+- `ckan_tag_list` applied `tag_query` after faceting, with `facet.limit` set to the
+  caller's `limit`. On dati.gov.it 53 tags contain "citta" and none is in the top 100, so
+  the filter answered "no tags" while they existed. The facet is now widened when a filter
+  is given.
+
+`openspec/specs/ckan-search/spec.md` described the parser as a property of
+`ckan_package_search` alone, which is what let the second caller go unnoticed — and after
+yesterday it was also wrong, still describing the per-portal default that was removed.
+Rewritten as a property of the query-building path, naming every tool that shares it.
+
+Also raised the candidate window to at least 50: the local ranking only sees what Solr
+returns first, and `limit: 3` shrank it to 15 — enough when a search returned a handful
+of results, not enough now.
+
+`defibrillatori Comune di Lecce` puts the Lecce dataset first again. 532 tests, 5 added.
+
+How it was missed: yesterday's verification checked result **counts** through
+`ckan_package_search`, never the ranked output of `ckan_find_relevant_datasets` — the
+third most used tool in the telemetry, and the second caller of `resolveSearchQuery`.
+Counting results proves recall, not usefulness.
+
+### v0.4.122 - Solr parser fix
+
+Ships #534: the `text:(...)` wrapper is reserved for the queries dismax cannot serve, the escaping preserves unary operators and balanced grouping, and the parser probe measures two terms taken from the catalog on every portal. `force_text_field` is gone from `portals.json`.
+
+### Solr: wrap only boolean queries, and measure every portal instead of storing a verdict
+
+The usage review surfaced an LLM client reformulating the same request against
+`www.dati.gov.it/opendata` for three hours on 29 July. The data was there from the first
+attempt: `bonifica siti contaminati Piemonte` returns 22 datasets on that portal, the
+Piedmont contaminated-sites registry first. Our `text:(...)` rewrite was returning 5.
+
+`package_search` hands a colon-free query to Solr's dismax parser with `q.op=AND`,
+`mm='2<-1 5<80%'` and `qf='name^4 title^4 tags^2 groups^2 text'` (`ckan/lib/search/query.py`).
+dismax has no boolean syntax, so `A OR B` collapses into `A AND B`: on dati.gov.it
+`aria OR Milano` returns 59, exactly what `aria AND Milano` returns. A colon takes the query
+off dismax, which is what the wrapper exploits — the wrapped form returns 3421. The same
+switch is why it hurts everything else: it drops the `qf` boosts that rank titles and tags
+first, searches the catch-all `text` field alone, and ANDs every term instead of applying
+`mm`. This is CKAN's own default, not a per-portal defect, which is why the same pattern
+showed up on Milano, Toscana, Sicilia, Ucraina and open.canada.ca.
+
+Measured on dati.gov.it: `defibrillatori Comune di Lecce` 678 -> 1, `qualità aria Milano`
+650 -> 51, `musei roma arte opere catalogo` 9 -> 0 — the second most repeated query of the
+semester, answered with an empty page while nine datasets existed. On 40 real queries from
+telemetry the separation is clean: with a boolean operator the wrapper helped 8 times and
+hurt none; without one it helped none and hurt 10, six of them down to zero.
+
+So the wrapper now applies only to queries carrying a boolean operator. The shape that an
+LLM client generates from a user's request — a run of keywords, no operators — is left to
+the portal's own parser, boosts and `mm` included.
+
+`probePortalParser` was rewritten and now runs for every portal, configured ones included;
+`force_text_field` is gone from `portals.json` (8 entries) so there is one source of truth.
+The old probe asked `data OR dati`, two words common enough to saturate: on Milano `data`
+alone and `data OR dati` both return 2564, so it read the portal as healthy while
+`aria OR acqua` returned 0 against 54 and 33 for the single terms. It now picks two terms
+from the catalog itself — single-word tag facets between 0.5% and 30%, falling back to
+frequent title words — and compares `A`, `B`, `A OR B`, `text:(A OR B)`. An OR returning
+fewer hits than either operand is not being honoured, and the wrapper is the answer only if
+the wrapped form returns more. `data.stadt-zuerich.ch`, where the `text` field returns 0 for
+every query, is correctly left alone.
+
+Cost: a plain query pays nothing, since nothing but a boolean query can be wrapped. The
+probe costs 5 extra `rows=0` calls the first time a boolean query reaches a portal in a
+session, then nothing.
+
+Verified e2e against live portals: dati.gov.it 5 -> 22 and 0 -> 9 on the two queries from
+the telemetry, Milano `aria OR acqua` 0 -> 87, Zurich unchanged at 10 and 172. 516 tests
+pass, 18 added.
+
+### v0.4.121 - clearer 404 on datastore_search_sql
+
+Patch release for the fix in #532: a 404 on `datastore_search_sql` now says the portal does not expose the SQL endpoint, instead of sending the caller to `ckan_package_show` for a resource_id that was already valid. Also ships the telemetry pipeline fixes and the DEPLOYMENT.md/CLAUDE.md realignment from earlier today.
+
+### DEPLOYMENT.md and CLAUDE.md realigned with the actual deployment
+
+Six things the deployment guide got wrong, all verified against the live system:
+
+- tool count stuck at 7; `/health` reports 20 tools, 7 resources, 6 prompts on v0.4.120
+- bundle "~400KB" in two places, while the doc's own sample output said 541 KiB; rebuilt: 533 KB
+- the free tier presented as the configuration in use. Workers Observability keeps 7 days of telemetry on this account (measured: events at 7 days back, none at 8), which is the paid retention — the free-tier request and CPU limits are not the ones this deployment operates under
+- `demo.ckan.org` in three curl examples, which CLAUDE.md forbids for tests
+- the release workflow told you to commit and push straight to `main`, in both files. Now branch, PR, squash-merge, then tag on the merged commit
+- a stale `Co-Authored-By` line in the sample commit
+
+Also corrected the troubleshooting entry calling CPU-limit errors "rare": 22 in the first four days of September against 11 in all of August. Left flagged as unexplained.
+
+Left alone on purpose: archived OpenSpec proposals, historical LOG entries, and `demo.ckan.org` where it appears as an example for end users (README, EXAMPLES, SKILL) rather than as a test target.
+
+### 404 on datastore_search_sql: hint sent callers round a loop
+
+A 404 on `datastore_search_sql` fell into the generic `datastore_search` branch of
+`formatCkanError`, which answers "get a valid resource_id first: call `ckan_package_show`".
+On a portal that does not expose SQL the resource_id is fine and `ckan_package_show`
+hands back the same one, so a client following the hint retries into the same 404.
+
+SQL access is optional in CKAN and widely disabled: `datastore_search_sql?sql=SELECT 1`
+returns 404 on Toronto's portal and 200 on dati.comune.messina.it, while
+`datastore_search` answers 200 on both. A bad table name comes back as a 400, not a 404,
+so a 404 on that action means the endpoint itself is missing. The hint now says so and
+points at `ckan_datastore_search`.
+
+Verified e2e: Toronto returns the new hint; Messina counts 202.906 rows in a single SQL
+call. 498 tests pass, one added.
+
+### Telemetry pipeline: cross-worker contamination, missing outcome, unattributable errors
+
+A usage review of `worker_events_flat.jsonl` surfaced three defects in the measurement itself, all confirmed against the live Observability API:
+
+- The query filtered only on `$metadata.type = cf-worker`, with no `service` filter, so events from `opensdmx-mcp` (another Worker on the same account) were archived here: 7 out of 31 events in a 48h probe, 589 `sdmx_*` records in the May-July history. Added `$metadata.service = ckan-mcp-server` (env override `CF_SCRIPT_NAME`); the probe then returned 24/24 ckan events. The existing records cannot be cleaned: retention is 3 days.
+- `$workers.outcome` disappeared from the API on 2026-07-12 (the object now carries `spanId`/`traceId` instead). Not a regression of ours: the archiver's only refactor is 7e78b32, March. The replacement was already there and unused: `src/worker.ts` logs its own `status` per call, plus `cache_hit`, `duration_ms` and `limit`, and the archiver was throwing all four away. `resolve_outcome()` now reads `$workers.outcome`, then `source.status`, then `$metadata.level`, and writes `unknown` rather than assuming `ok`. On a 47-event live sample it resolved every record (40 ok, 7 error, no unknown), CPU-limit crashes included. July-September stays null and cannot be backfilled: retention is 3 days.
+- `worker_daily_stats.sh` had been writing `ok:0, errors:0` on every row since that date. It now derives the error flag from `error IS NOT NULL OR outcome IN (...)`, which stays valid across the schema change. March figures are unchanged; August and September are populated again (2026-09-03: 240 calls, 220 ok, 20 errors).
+
+Flat schema gains `script_version`, `request_id`, `trigger`, `cache_hit`, `duration_ms`, `limit`. Without the first, a CPU-limit event cannot be tied to a release, and those events carry no `tool` or `server` either; they now do carry the version, so September's 22 CPU errors in 4 days (against 11 in the whole of August) become attributable from here on, not retroactively. `cache_hit` and `limit` answer the two questions this review could only guess at: cache fragmentation from URL spelling, and page size on the long datastore loops. Older records are padded to the same field set on rewrite.
+
+Usage, excluding March (evaluation traffic: 2.953 calls, 242 portals) and the sdmx events: ~470-1.450 calls a month, median 13,5 a day, very spiky. `ckan_datastore_search` leads (1.142 since June), and on 2026-08-24 a single client generated 392 calls with 6 distinct queries paging Toronto's datastore. Callers spell the same portal in three or four ways (`dati.gov.it/opendata`, `www.` variant, trailing slash; `open.canada.ca` in three forms), which fragments the cache key.
+
+### v0.4.120 - SSRF hardening release + dependency audit
+
+Releases PR #531 (env-proxy refusal, multicast/reserved/site-local ranges, see 2026-09-04 entry). Also:
+
+- `npm audit fix`: axios 1.13.2 -> 1.20.0 (29 open advisories, including NO_PROXY/SSRF bypasses), follow-redirects -> 1.16.0, wrangler -> 4.129.0, vitest -> 4.1.11. Remaining findings (body-parser, express, qs) need express 5, a major: left for a dedicated change.
+- `src/server.ts` and `src/worker.ts` were still at 0.4.118: the 0.4.119 bump skipped them because CLAUDE.md's release step lists only the three JSON files. Fixed here.
+- Verified: build, worker build, 497 tests, real HTTP e2e (search on dati.gov.it, datastore on Messina, `169.254.169.254` still refused).
+
+## 2026-09-04
+
+### SSRF guard aligned with datagouv-mcp v1.0.0
+
+Compared our `isBlockedIp` and request chain against the SSRF hardening shipped in [datagouv-mcp v1.0.0](https://github.com/datagouv/datagouv-mcp/releases/tag/v1.0.0) (PR #126, external report). Connect-time pinning, redirect re-checks and IPv4-mapped/6to4/NAT64 unwrapping were already in place; their specific vector (fetching producer-supplied URLs from catalog metadata) does not apply here. Two gaps closed:
+
+- `proxy: false` on the axios path: with `HTTP_PROXY`/`HTTPS_PROXY` set, axios connected to the proxy and the SSRF-safe lookup validated only the proxy's IP, not the target's.
+- `isBlockedIp` now also rejects 224.0.0.0/4 (multicast), 240.0.0.0/4 (reserved), ff00::/8 (IPv6 multicast) and fec0::/10 (site-local). Running their 37 test cases against our function surfaced exactly these.
+
+## 2026-08-31
+
+### Support #4682889 answered: the Advisory Database queue reaches back to June 2026
+
+Second reply from Tempy (25 August, seen on the portal - the notification was in the inbox but the question was already answered before I looked): the advisory curation team confirmed that publication of repository advisories to the Global Advisory Database **is queued**, reviewed manually, and that "the advisory publication queue stretches back to June 2026", with work under way to reduce it.
+
+So nothing is wrong with the records. The pattern we measured fits the explanation exactly: the only two advisories in the global database are the oldest ones (March and May), and CVE-2026-61612 (June) sits right at the edge of the backlog. Nothing on our side accelerates this, and there is no action left - the ticket auto-closed after seven days and is best left closed.
+
+Worth keeping: **Dependabot alerts are driven from the advisory in the database, not from the CVE assignment** (Support, 24 August). The thirteen CVEs this repository now holds are a public reference, not downstream protection - that arrives only when the advisory clears the queue.
+
+## 2026-08-24
+
+### Support #4682889: GitHub answers about CVEs, the question was about advisories
+
+First reply from GitHub Support (Tempy). It attributes the delay to an industry-wide surge in CVE publication and records being processed in order of arrival - which answers a question the ticket did not ask. The useful part is a statement that undercuts that very explanation:
+
+> The associated advisory in the GitHub Advisory Database is published independently of the CVE record, and Dependabot alerts are driven from the advisory - not the CVE assignment.
+
+If alerts are driven from the advisory, the CVE backlog cannot explain twelve published advisories being absent from the database. Replied restating the scope, with a new data point: `GHSA-x32r`, published 2026-08-20, is at its third working day and still not in the database either - so this is not confined to the older records.
+
+State unchanged: 14 published advisories, 2 in the global database, 13 carrying a CVE. Linked from the reply: "Inside the Advisory Database and what happens when vulnerability volume breaks records", which suggests the bottleneck is database curation rather than CVE issuance. If that is the answer, "queued, and the queue is long" would be enough - and is worth asking for explicitly.
+
+## 2026-08-20
+
+### CVEs issued for the four narrowed advisories
+
+The 2026-08-15 narrowing round came back green: `GHSA-vqff` -> CVE-2026-76894, `GHSA-c499` -> CVE-2026-76895, `GHSA-3369` -> CVE-2026-76896, `GHSA-v3j5` -> CVE-2026-76897. Arguing dependency for `GHSA-c499` (one missing neutralization pass produces both the injection and the spoofing) worked as well as splitting did for the others - no advisory had to be re-published as a new one. Every published advisory now carries a CVE except `GHSA-x32r`, requested today.
+
+`SECURITY.md` updated. The propagation gap is unchanged and remains the subject of ticket #4682889: a CVE is necessary but not sufficient, and the global database still lists two of fourteen.
+
+### v0.4.119 - classify IPv6 by value, not by prefix string (GHSA-x32r-mh7g-q2rf)
+
+`0xRomSec` reported that `isBlockedIp` misses the IPv6 ranges that embed an IPv4 address: NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4 (`2002::/16`) and IPv4-compatible (`::/96`). Verified against the real function - all eight cases in the report return `false`. `64:ff9b::a9fe:a9fe` is 169.254.169.254 written in IPv6, and the function is the single decision point for both the literal guard and the DNS-resolution guard, so the gap applied to both halves.
+
+Fixed structurally rather than by appending a fifth prefix: `parseIpv6` expands any spelling (compressed, expanded, upper-case, leading zeros, dotted-quad tail, zone id) into eight 16-bit words, and the classifier decides on values. Unparseable input fails closed. Added `2001::/32` (Teredo) and IPv4 `198.18.0.0/15` as hardening - both embed *public* addresses and open no path to RFC1918, so they sit outside the vector.
+
+The DNS half needed no change: `createSsrfSafeLookup` already passes `all: true` with `family: family || 0` and iterates every result, so an AAAA record was always inspected - it was the classifier that waved it through. Checked before writing the fix, since a `family: 4` there would have made the patch half a fix.
+
+Tests: the eight advisory cases, four non-canonical spellings of the same address, four unparseable literals, `198.18.0.0/15` boundaries, plus three guard-level regressions that exercise the actual bypass chain (literal guard, `assertHostnameResolvesSafe`, connection-time lookup) rather than the classifier alone. 495 passing. Both build targets checked - `http.ts` is shared with the Workers bundle.
+
+Released the full round: npm 0.4.119 (CI, provenance), GitHub release with dxt/skill assets, Cloudflare deployed and verified in prod (`http://[64:ff9b::a9fe:a9fe]` rejected, normal search intact), MCP Registry 0.4.119 `isLatest=true`.
+
+API note, same class as the missing comments endpoint: **there is no `POST .../security-advisories/{ghsa}/publish`** - 404, and the OpenAPI description lists only `get`, `patch`, `cve` and `forks` for that path. Publishing an advisory is UI-only. `PATCH` (description, `patched_versions`) and `POST .../cve` do work from the API.
+
+## 2026-08-20
+
+### CVE-2026-76811/76812/76813 issued; advisory table added to SECURITY.md
+
+GitHub issued CVEs for the three advisories still pending from the July batch: `GHSA-38f8` (CVE-2026-76811, High), `GHSA-vmrr` (CVE-2026-76812, Critical) and `GHSA-q5gv` (CVE-2026-76813, High). All three were already published and patched (0.4.110 / 0.4.111), so no action was required on the advisories themselves. The 2026-08-15 narrowing round (`GHSA-3369`, `GHSA-v3j5`, `GHSA-c499`, `GHSA-vqff`) is still without an outcome.
+
+`SECURITY.md` now carries a GHSA → CVE → fixed-in table for all thirteen published advisories, plus a supported-versions note. Until now the CVE mapping existed only scattered across LOG entries.
+
+Propagation remains the real gap. `GET /advisories?affects=@aborruso/ckan-mcp-server` still returns only two records (CVE-2026-33060, CVE-2026-53509) out of thirteen published advisories, so Dependabot has never alerted downstream users about the other eleven — including the Critical SSRF-to-cloud-metadata one. CVE-2026-61612 has had its CVE since 2026-06-22 without propagating, which argues against a plain review backlog. Escalated to GitHub Support as ticket **#4682889** (org `ondata`, category Repositories / repository features), 2026-08-20. The portal's AI triage confirmed the reading before letting the ticket through: the documented review window after publication is 72 hours, nothing in the docs describes a further maintainer action to force propagation, and inspecting why some advisories were promoted and others not requires Support. Draft kept in `tmp/github-support-advisory-propagation.md`.
+
+## 2026-08-15
+
+### CVE requests: three rejected advisories narrowed and resubmitted
+
+GitHub issued CVE-2026-73844 (`GHSA-6f9w`), CVE-2026-73845 (`GHSA-83x6`) and CVE-2026-73846 (`GHSA-78x9`), and rejected three others under CNA rule 4.2.11 — each advisory described more than one independently fixable vulnerability. The requests originate from `GHSA-p5c9`, where the reporters (Gal3m, mrostamipoor) asked for one CVE per finding.
+
+Rather than split published advisories into new public ones, each was **narrowed** to a single defect, with the rest demoted to impact or deployment context:
+
+- `GHSA-3369` — kept the second-order SSRF (destination derived from resource `url` metadata); dropped the `Promise.all` amplification claim, which a concurrency cap fixes independently. CWE-400 removed; vector `S:U/C:L/A:L` (4.7) → `S:C/C:L/A:N` (4.0, still Medium).
+- `GHSA-v3j5` — kept the missing `Origin`/`Host` validation. The MCP spec (Basic/Transports) draws the line for us: origin validation is **MUST**, loopback binding and authentication are **SHOULD**. The latter two stay as deployment context. CWE-306 and CWE-1327 removed.
+- `GHSA-c499` — argued dependency rather than narrowing: one missing neutralization pass at the render boundary produces both the prompt injection and the content spoofing, and no patch fixes one without the other. The remediation section was rewritten as a single control (it previously listed two, which read as two defects). CWE-79 removed.
+
+Also requested the CVE for `GHSA-vqff`, which was in the reporters' list but had neither a CVE nor a rejection — the request had apparently never been submitted.
+
+API notes: `PATCH /repos/{o}/{r}/security-advisories/{ghsa}` accepts `summary`, `description`, `cwe_ids`, `cvss_vector_string` (mutually exclusive with `severity`); `POST .../{ghsa}/cve` re-requests the CVE. There is **no** comments endpoint (404, absent from the OpenAPI description) — advisory comments were posted by replying to the GitHub notification email.
+
+Worth noting for expectations: a CVE is necessary but not sufficient for Dependabot alerts. Only 2 of the repo's advisories are in the global GitHub Advisory Database; CVE-2026-61612 has had a CVE since 2026-06-22 and is still not propagated.
+
+## 2026-08-06
+
+### v0.4.118 — pin the fetch path to the validated IP
+
+`GHSA-r8hw-3fch-r42w` reported the v0.4.108 SSRF fix as bypassable by DNS rebinding, with a PoC pointing `ckan_package_search` at `7f000001.7f000001.rbndr.us`. Reproduced: the PoC is blocked. Both halves of that label decode to 127.0.0.1, so the name never rebinds — it is a plain DNS-name-to-loopback, the case v0.4.108 already closed. Replaying it against `localtest.me` with a listener on 127.0.0.1:8054 is rejected by `createSsrfSafeLookup`, and a genuine rebinding fake-DNS (public IP first, loopback second) through the axios agent produces exactly one lookup with the connection pinned to the validated address.
+
+The class was right on the wrong path, though. `safeFetch()` — used by `sparql_query` and the MQA quality tools — validated the hostname with `assertHostnameResolvesSafe()` and then let undici resolve it a second time, which is a real TOCTOU window. `getSafeDispatcher()` now builds an `undici.Agent({ connect: { lookup: createSsrfSafeLookup(dns) } })` and `safeFetch` passes it on every hop, so the socket connects to the address that was just checked. `assertHostnameResolvesSafe()` stays as defence in depth for runtimes without a dispatcher (Workers, where the CF sandbox blocks internal egress anyway).
+
+`undici` becomes an explicit dependency: it was only present transitively through wrangler, i.e. absent in production installs. The import specifier is assembled at runtime (`["und","ici"].join("")`) because esbuild constant-folds `"undici" + ""` and would otherwise bundle all of undici into `dist/index.js` (207 KB → 969 KB) and break the browser-platform Workers build.
+
+Same trap on the other side: because the specifier is dynamic, the DXT bundle cannot contain undici either, and a `.dxt` unpacked by Claude Desktop has no `node_modules` to resolve it from — the dispatcher would have been null and the pin silently inert. `pack:dxt` now copies `node_modules/undici` into `dxt-staging/server/node_modules/` (+1.7 MB uncompressed), verified by resolving it from a copy of the staging dir outside the repo.
+
+`engines.node` moves to `>=18.17.0`, undici 6's own floor — the old `>=18.0.0` would have promised installs that cannot work.
+
+Also fixed the `serverInfo` version, hardcoded at `0.4.108` in `src/server.ts` and `src/worker.ts` while the package was at 0.4.117.
+
+## 2026-08-04
+
+### v0.4.117 — escaping portal-controlled strings
+
+Field names, titles, cell values and every other short string coming from a third-party portal were interpolated into markdown structure unescaped. Since every response here is read by a model, that has two effects: a newline ends the construct and opens a line that reads as server-authored — indistinguishable from the `> **Note**:` lines this server writes to instruct the model — and an unescaped `|` adds table cells, shifting later values under the wrong header.
+
+Worst case was `ckan_analyze_datasets`, which used none of the existing defenses and rendered the DataStore Data Dictionary (`info.notes`, publisher free text) straight into a bullet list. A newline let a portal fabricate a field entry, in the very tool an agent calls to learn which fields exist.
+
+`sanitizeInline` now sits in `utils/formatting.ts` beside `wrapUntrusted` and `safeUrlText`: collapses newlines, escapes pipes, and replaces backticks with U+02BC so a value cannot close the inline code span it is rendered in. It promotes the private copy that lived in `datastore.ts` and retires the three ad-hoc `.replace(/[\r\n]+/g, ' ')` copies, which stripped newlines but escaped neither pipes nor backticks.
+
+Long free text keeps `wrapUntrusted` — a fence states "this is data" better than escaping — and was already safe. The JSON path was never affected. URL query parameters use `encodeURIComponent`, not the markdown escaper: `&` and `#` would otherwise pass through.
+
+Three review rounds on #45, each finding real gaps. Two are worth recording. The first automated sweep matched `markdown +=`, so every renderer's opening `let markdown = \`# ...\`` escaped it — all four top-level headings. And the sweep wrapped two scoring weights that are our own numbers, not portal strings; both reverted. A grep-driven audit produced a false sense of completeness twice; if anything else surfaces, the answer is a generative test that enumerates portal fields, not a fourth grep.
+
+485 tests, 15 of them new.
+
+### v0.4.116
+
+Ships the two DataStore output fixes below, plus `.greptile/rules.md`: the automated review on #43 produced one confident false positive, so the invariants a generic reviewer cannot know are now stated in the repo.
+
+### DataStore tables no longer hide columns silently
+
+Both markdown renderers in `src/tools/datastore.ts` cut the record table at 8 columns with no notice. On the Messina electoral-lists resource (14 columns) the table stopped right before `cognome`, `nome`, `sesso` and `voti`: a model reading it saw an election dataset with no votes and no candidate names, and nothing told it anything was missing. Row truncation was already handled properly (`... and N more records`, `Total Records`); columns were not.
+
+Both renderers now append a note naming the omitted columns and pointing at the way to retrieve them (`fields` parameter for search, an explicit SELECT list for SQL, or `response_format: "json"`). The JSON path never had the bug — `compactDatastoreResult` passes every column through.
+
+Found while checking what the GovInsider piece on the OKFN Brazil/Uruguay pilot added to `docs/future-ideas.md` (nothing new — it covers the same pilot already recorded on 2026-06-11), but its failure mode is exactly this: the model fills a gap it cannot see.
+
+### `_full_text` no longer eats a table slot
+
+Surfaced by the end-to-end check above: `datastore_search_sql` on `SELECT *` returns CKAN's internal `_full_text` column, which repeats the whole row as one concatenated string. It was taking the first table slot and pushing out a real column, and the same query reported 15 columns via SQL against 14 via `datastore_search`. `_id` was already filtered; `_full_text` now is too, in both renderers and in the JSON output (where it was pure token waste). The two tools now agree on the column count.
+
+465 tests pass; verified end to end against `dati.comune.messina.it`.
+
+## 2026-08-03
+
+### v0.4.115
+
+First release published from CI. No functional change: this exists to exercise the release workflow added earlier today end to end — tag guard, OIDC authentication, provenance attestation — rather than discovering whether it works during a release that actually matters.
+
+Worked on the first try: the job went green in 34s and the attestation binds the tarball to `ondata/ckan-mcp-server`, workflow `release.yml`, ref `refs/tags/v0.4.115`, on a GitHub-hosted runner. `npm view @aborruso/ckan-mcp-server@0.4.115 dist.attestations` returns an SLSA v1 provenance; the same query on the hand-published 0.4.114 returns nothing.
+
+One snag worth remembering: `mcp-publisher` failed with an expired JWT, and re-running `login github` then died with `incorrect_device_code` before the browser step. Neither error named the real cause — the local binary was **1.5.0 from 6 March**, and the device-auth flow changed by **1.8.0**. Updating the binary fixed it. When the registry token expires, check the publisher version too: both were installed the same day and go stale together.
+
+
+
+### npm provenance: release workflow on tags
+
+`npm view @aborruso/ckan-mcp-server@0.4.114 dist.attestations` came back empty — packages were published by hand from a local machine, with nothing binding a tarball to the commit that produced it. Adopters could check *which* version was current (see below) but not *where it came from*.
+
+- New `.github/workflows/release.yml`: triggers on `v*` tags, verifies the tag matches `package.json` **before** anything else (npm publishes are irreversible after 72h), then `npm ci` → build → tests → `npm publish --provenance`. Guard tested both ways; `npm test -- --run` confirmed against the current 461-test suite.
+- `package.json` had **no `repository` field** — a hard prerequisite for provenance, which would have failed the publish. Set to `ondata/ckan-mcp-server`.
+- Release workflow in `CLAUDE.md` rewritten rather than extended: step 5 now warns that pushing the tag *is* the publish, step 9 says explicitly not to run `npm publish` by hand (two paths would collide on `EPUBLISHCONFLICT`), and step 10 must wait for the CI run to go green because the MCP Registry validates that the npm version exists.
+- `.readme-full.md` added to `.gitignore`: the `prepack`/`postpack` pair swaps in the short npm README, so a local publish failing between the two hooks leaves the wrong `README.md` in the tree, one `git add .` away from being committed.
+- Authentication is **trusted publishing (OIDC)**, not a secret. The first draft used an `NPM_TOKEN`; `npm profile get` then surfaced npm's own warning that "tokens that bypass 2FA are being restricted for direct publishing", which pointed at the mechanism npm now recommends instead. Trusted publishing needs no stored credential, emits provenance by default, and — because the trusted publisher names the GitHub repo explicitly — also settles the open question about the npm scope (`@aborruso`) differing from the GitHub org (`ondata`). The workflow upgrades npm to ≥ 11.5.1 explicitly: Node 22 ships npm 10.x, which falls back to token auth *silently* and would publish unattested. `--provenance` is kept although implied, so that degradation fails the job instead of passing quietly.
+- **Not yet active**: the trusted publisher has to be registered by hand on npmjs.com (package → Settings → Trusted Publisher → GitHub Actions → `ondata` / `ckan-mcp-server` / `release.yml`). Until then the workflow runs and fails at the publish step. Note that the workflow filename is part of that identity.
+
+### MCP Registry entry realigned to 0.4.114
+
+Published and verified against the public endpoint: the registry now serves **0.4.114** with `isLatest: true` (updated 2026-08-03T06:01:07Z), and the old 0.4.83 record dropped to `isLatest: false`.
+
+The official MCP Registry entry for `io.github.aborruso/ckan-mcp-server` had been stuck at **0.4.83 since 2026-03-12** — 31 patch releases and almost five months behind npm, while still flagged `isLatest: true`. Clients resolving the server through the registry were pointed at a build predating the v0.4.108 SSRF remediation, and 0.4.83 is still installable from npm.
+
+- Root cause, not a one-off slip: the Release Workflow in `CLAUDE.md` listed the version bump for `package.json` and `manifest.json` but never `server.json`, and `npm publish` does not touch the registry. The drift was structural and would have kept growing.
+- Fixed `server.json` (both `version` and `packages[0].version` — two fields, easy to half-update) and rewrote the release workflow: `server.json` added to step 1, a new step 10 for `mcp-publisher publish` placed after `npm publish` since the registry validates that the npm version exists, plus a `curl` one-liner to verify the published entry.
+- Surfaced by an unsolicited vendor email selling a £395 "MCP Readiness Audit". The sales pitch was worthless — the remedy it offered has nothing to do with the defect — but the three technical claims all checked out under verification. Worth recording: the finding was real and cost the sender two `curl` calls, which is exactly how long it would have taken us to catch it ourselves with a check in the release procedure.
+- Registry tokens (`.mcpregistry_*`) verified: gitignored, never committed.
+
+## 2026-07-31
+
+### v0.4.114
+
+structuredContent capped like the text (closes #39).
+
+The v0.4.113 cap applied to `content[].text` only, so any client reading the structured channel got the full payload — `ckan_tag_list limit=1000` on dati.gov.it: ~50K of text against 65,382 uncapped characters. The limit was a fiction for those clients.
+
+- New `jsonToolResult()`: truncates once via `truncateJson` and parses the result back into `structuredContent`, so the two channels cannot disagree and `_truncated`/`_original_count` reach structured readers too. Applied to 13 call sites.
+- `ckan_status_show` and `ckan_find_portals` pair structured output with Markdown text, so there is no truncated JSON to derive it from: they cap it on its own via the new `cappedStructured()`. My first pass left them uncapped calling them "bounded by shape" — wrong, as review pointed out: `status_show` is echoed straight from the portal, and the 50-result limit on `find_portals` bounds the number of entries, not the length of their titles and URLs. Only the `all_fields=false` count branches of `ckan_organization_list`/`ckan_group_list` stay outside the cap: a single integer.
+- **Correction**: the deferral in v0.4.113 claimed capping would drop rows from `datastore-table-ui`. That was wrong and never verified — the UI resource is commented out in `src/resources/index.ts:18` and never registered, and `ckan_datastore_search` returns no `structuredContent` at all. No exception was needed. Same failure mode as the bug being fixed: a plausible claim about the code that nobody checked.
+- 7 new tests (461 total), covering a payload long in a single field rather than in many, and a bounded-count list whose entries are individually oversized. Docs realigned: `README.md`, `docs/JSON-OUTPUT.md`, `docs/DECISIONS.md`, `CLAUDE.md` all asserted the uncapped behaviour.
+- Released end to end: tag, GitHub release with DXT and skill, npm `0.4.114`, Cloudflare version `36b611fd`. Verified on the public endpoint after waiting for edge propagation — `tag_list limit=1000`: 49,938 characters on both channels, byte-identical, `_truncated` set. `status_show` and `find_portals` legitimately differ across channels: Markdown text against JSON structured output, two renderings of the same data.
+- Process note: check edge propagation with an active probe, not a fixed wait. The v0.4.113 verification measured the old code because it ran seconds after deploy, and briefly looked like a broken release.
+
+### v0.4.113 — release addendum
+
+Released the same day: tag, GitHub release with DXT and skill, npm `0.4.113`, Cloudflare version `1cac40ea`. Also merged #38 (`docs: document user-facing limits`, contributed by `averyquinnhq`), which closed #37, and disabled the `claude-code-review` workflow: it cannot pass on fork PRs, since GitHub withholds secrets and the OIDC token for `pull_request` events from forks, so the job dies on token setup regardless of the diff. The file is kept in the repo. `CONTRIBUTING.md` now also states that `build:tsc` is not a gate — a contributor exhausted 8 GB of heap on it before reporting they could not pass it, because the warning lived only in `CLAUDE.md`.
+
+### v0.4.113
+
+JSON output always parseable (issue #39).
+
+The docs promised "always valid JSON"; the code did not deliver it. Surfaced while reviewing PR #38 (an AI contribution by `averyquinnhq`), which documented the real behaviour and contradicted issue #37 — the PR was right.
+
+- **Live repro**: `ckan_tag_list limit=1000` on dati.gov.it → 50,046 characters, `JSON.parse` fails. Not a corner case: an ordinary call.
+- **`truncateJson`**: the last-resort branch cut the serialized string (`truncateText(JSON.stringify(...))`, with an in-code comment admitting "may produce invalid JSON"). It now empties arrays progressively and, when that is not enough, degrades to a valid `{_truncated, _error}`. `SHRINKABLE_KEYS` extended (+`rows`, `datasets`, `portals`, `facets`, `fields`) with a sacrifice order: bulk rows first, `fields` last.
+- **8 tools + 4 Resources** used `truncateText(JSON.stringify(...))` directly: routed through `truncateJson`. `sparql_query` appended `/* output truncated */` to cut JSON (JSON has no comments): rewritten.
+- **4 tools with no cap at all**: `ckan_get_mqa_quality`, `ckan_get_mqa_quality_details` (bare JSON.stringify), `ckan_find_portals`, `ckan_status_show` (markdown).
+- **A third unparseable path**: no `catch` honoured `response_format` — every error came back as prose even with `json`. New `formatError()`; errors now return `{error, _error: true}` plus `isError: true`. Zod validation errors stay textual (emitted by the SDK before the handler runs).
+- **`structuredContent` stays uncapped** (65,382 characters against 50,000 of text on tag_list): capping it would drop rows from `datastore-table-ui`, which consumes it. Decision deferred, documented in `docs/DECISIONS.md`.
+- 10 new tests (`truncateJson` had none), 453 passing. E2e: `tag_list` from PARSE-FAIL to parse-ok; real errors parseable in json mode.
+- `CONTRIBUTING.md`: section on AI-assisted contributions (disclosure, small diffs, verifiable claims).
+- Review follow-up: `addDemoFooter()` was appended to JSON output in `quality.ts`, breaking parsing on Workers — now wraps the Markdown branch only, inside `truncateText`. Added `isError: true` to the two non-dati.gov.it guards. The `truncateJson` fallback now degrades further so it always respects small limits. 454 passing.
+
+## 2026-07-09
+
+### v0.4.112
+
+Security — Round 3: hardening (closes the last group of advisories in triage).
+
+- **Error reflection**: `makeCkanRequest` no longer embeds the upstream body (`JSON.stringify(decodedData)`) in the error returned to the caller — now a generic action-scoped message, with detail on stderr only (truncated). `worker.ts` catch-all: removed `error.message` from the JSON-RPC `data` field (server-side logging only). Closes the semi-blind read channel of the SSRF.
+- **postMessage UI** (`resources/datastore-table-ui.ts`): the host origin is pinned from the reply to the `ui/initialize` handshake; messages carrying data are accepted only from that origin, and outbound messages use an explicit target origin (never `'*'`).
+- **Prompt injection on org/group**: extended the c499 containment to the `organization.ts` and `group.ts` renderers — `description` in an untrusted block (`wrapUntrusted`), newlines collapsed in lists.
+- 3 new tests (error no-leak, org/group description fencing); 443 passing. E2e: generic error on 404 (no internal body), normal requests fine. Worker build fine.
+
+### v0.4.111
+
+Security — Round 2: three distinct low-cost bugs.
+
+- **MQA allowlist bypass** (`isValidMqaServer`, `tools/quality.ts`): unanchored regex replaced by URL parsing plus exact host comparison (`dati.gov.it`/`www.dati.gov.it`). Suffix (`dati.gov.it.attacker.com`) and userinfo (`dati.gov.it@attacker.com`) tricks are now rejected.
+- **Decompression bomb / unbounded buffering** (`utils/http.ts`): response size cap (`maxContentLength`/`maxBodyLength` on axios plus a byte check on `arrayBuffer` in the fetch branch, default 32MB) and decompression output cap (`maxOutputLength` on gunzip/brotli/inflateSync plus a check on DecompressionStream, default 64MB). Override via `CKAN_MAX_RESPONSE_BYTES`/`CKAN_MAX_DECOMPRESSED_BYTES`. Stops OOM/stalls from hyper-compressed payloads.
+- **Cache-key collision** (`utils/cache.ts`): `canonicalizeParams` now produces typed canonical JSON (recursive sort) instead of a `k=v` join with unescaped `&`; `buildCacheKey` frames it in `JSON.stringify([url,action,canon])`. `{q:"budget",rows:10}` and `{q:"budget&rows=10"}` no longer collide.
+- 2 new tests (plus updated regressions); 440 passing. E2e: valid MQA host reaches data.europa.eu, bypass rejected, normal requests fine. Worker build fine.
+- Further hardening in progress for upcoming releases.
+
+### v0.4.110
+
+Security — Round 1: SSRF cluster on the `fetch` path (GHSA-vmrr, GHSA-38f8; GHSA-8hxx clarified):
+
+- **Centralized `safeFetch()`** in `utils/http.ts`: `redirect:"manual"` plus re-validation of every hop (`validateServerUrl` + `assertHostnameResolvesSafe`), bounded hops, `httpsOnly` option. Closes redirect-SSRF (e.g. a public endpoint 302-ing to `169.254.169.254`) without breaking legitimate canonical redirects. Used by `sparql_query` (3 fetches) and by the MQA metrics fetch in `quality.ts`.
+- **`assertHostnameResolvesSafe` is now fail-closed**: it distinguishes "DNS module absent (Workers) → no-op" from "resolution failed → throw". Previously a DNS error let the request proceed (fail-open / TOCTOU).
+- **GHSA-8hxx**: verified that WHATWG `URL` already normalizes IPv4 encodings (int/hex/octal/short) to dotted-decimal before `validateServerUrl` → the existing check already covers them. No code added (the advisory PoC tested the regex against raw strings, not the parsed hostname). Only a comment and regression tests. The remaining `::7f00:1` (IPv4-compatible IPv6) is not routable, as the advisory itself concedes.
+- MQA fetch: constant host (`data.europa.eu`), so hardening for consistency rather than a real vector.
+- 6 new tests (redirect→internal blocked, redirect→non-HTTPS rejected, fail-closed on DNS error, IPv4 encodings blocked). 438 passing. E2e: Wikidata via `safeFetch` fine, internal IP blocked. Worker build fine.
+- Further security hardening in progress for upcoming releases.
+
+### v0.4.109
+
+Security hardening — 3 advisories, "poison and door" (environmental risk before the knives):
+
+- **GHSA-3369** (second-order SSRF, `ckan_list_resources`): source-portal probing is now **opt-in** (`check_source_portal` defaults to `false`). It used to be ON: listing a dataset's resources contacted hosts and ports taken from the dataset's own data (confused deputy + port-scan oracle + amplification via `Promise.all`). Added: ports other than 80/443 dropped in `extractSourcePortal` (uses `hostname`, not `host`), fan-out capped at 10 probes.
+- **GHSA-c499** (indirect prompt injection): free-text portal fields (`notes`, resource `description`) were rendered verbatim in the output. They are now wrapped in a delimited `untrusted` block with a warning (`wrapUntrusted`), with inner fences neutralized; portal URLs are scheme-validated (http/https only) and rendered as inline code (`safeUrlText`); `ckan_list_resources` table cells are neutralized (`|`, newlines). Containment, not a complete fix — documented for integrators.
+- **GHSA-v3j5** (exposed HTTP transport): binds to **`127.0.0.1`** by default (was `0.0.0.0`), `enableDnsRebindingProtection` plus `allowedHosts`/`allowedOrigins`. `docker-compose.yml` publishes on `127.0.0.1:3000:3000` (with `CKAN_HTTP_HOST=0.0.0.0` inside the container). New env vars: `CKAN_HTTP_HOST`, `CKAN_HTTP_ALLOWED_HOSTS`, `CKAN_HTTP_ALLOWED_ORIGINS`. Closing this door downgrades the whole SSRF cluster from "remote" to "local".
+- 4 new tests; 432 passing. Verified e2e against a real HTTP deployment (loopback bind, 403 on disallowed Host, no probing by default, notes fenced). Worker build fine.
+- Docs: README (HTTP env var table), SKILL (source-portal now opt-in), docker/README, docker-compose.
+- **Not done yet** (fetch SSRF cluster, MQA regex, cache, decompression bomb, postMessage UI): knives and hardening, in later rounds.
+
+## 2026-06-22
+
+### v0.4.108
+
+- Security fix (GHSA-798p-78g2-v556): close DNS-name SSRF bypass — `validateServerUrl` only checked the hostname string, so a name resolving to an internal IP (e.g. `lvh.me` → `127.0.0.1`, `*.nip.io` → cloud IMDS) bypassed the guard. Added DNS resolution + validation of every resolved IP, with connection pinning via a custom `lookup` agent (closes DNS-rebinding and redirect-to-internal) on the Node/axios path; pre-resolution check on the fetch-based `sparql_query` (HTTPS-only). Extracted `isBlockedIp` shared by literal and resolved-IP guards. `maxRedirects: 5` on CKAN requests.
+- Hardening: the network-exposed HTTP transport now refuses to start without `CKAN_ALLOWED_DOMAINS` (default-deny), unless explicitly opted out with `CKAN_HTTP_ALLOW_ALL=true` (logs a warning). stdio stays open. Cloudflare Worker unaffected (CF sandbox already blocks internal addresses).
+- 11 new tests (isBlockedIp, SSRF-safe lookup, allowlist gate, DNS-bypass on sparql). Verified end-to-end against a real HTTP deployment.
+- Reported by: EchoSkorJjj
+
+## 2026-06-18
+
+### v0.4.107
+
+- `ckan_package_show`: surface DCAT-AP fields already returned by package_show but previously hidden in markdown output — Rights Holder (`holder_name` via readDcatExtra), Publisher (`publisher_name`), Update Frequency (`frequency`), Language (`language`), Access Rights (`access_rights`). Each printed only when present; no new tools or API calls. `conforms_to` deliberately excluded (renders as raw JSON). Verified on dati.gov.it (DCAT-AP-IT) and open.canada.ca (no regression).
+
+## 2026-05-31
+
+### v0.4.106
+
+- Security fix (GHSA-g84h-j7jj-x32p): block `ip6-localhost` and `ip6-loopback` SSRF bypass — hostname aliases present in `/etc/hosts` on Linux that resolve to `::1` but bypassed the existing SSRF filter (GHSA-3xm7-qw7j-qc8v); replaced single `localhost` check with a blocked-hostname `Set`; 2 new unit tests added
+- Reported by: hibrian827
+
+## 2026-05-25
+
+### v0.4.105
+
+- Fix (scoring): `ckan_find_relevant_datasets` now scores `holder_name` (DCAT-AP_IT `dct:rightsHolder`) and `publisher_name` (`dct:publisher`) as distinct weighted fields, separate from `organization`
+- Rationale: on federated catalogs (e.g. `dati.gov.it`, but the pattern applies to any portal harvesting from sub-publishers), `organization` is the harvesting catalog (e.g. `regione-puglia`), NOT the data owner. Queries like "datasets from Comune di Lecce" previously scored 0 on the owner field when the dataset was harvested via Regione Puglia or a local action group, missing the actual `rightsHolder`
+- The fields are read from `extras[]` (the authoritative DCAT-AP_IT location on Italian portals) with fallback to root-level. On dati.gov.it, `package_search` exposes `holder_name` and `publisher_name` both in `extras[]` (correct DCAT values) and at root (often overwritten by the harvester with the organization name); reading only the root would be wrong. The root-level fallback preserves correct behavior on non-DCAT-AP_IT portals (data.gov, open.canada.ca)
+- Bug surfaced on real-world Puglia datasets: `defibrillatori-esterni` (extras.holder=Comune di Mesagne, root.holder=GAL Terra dei Messapi, organization=GAL Terra dei Messapi) and `defibrillatori-dae-progetto-comune-cardioprotetto` (extras.holder=Comune di Lecce, organization=Regione Puglia)
+- Defaults: `holder=4` (peer with `title` — actual institutional owner per DCAT-AP_IT), `publisher=2` (lower because sometimes a technical role like "Redazione OD" rather than the institution)
+- API: `weights` object accepts two new optional fields (`holder`, `publisher`); backward-compatible — clients not setting them get the improved scoring by default
+- Types: added `holder_name?: string` and `publisher_name?: string` to `CkanPackage` interface (previously accessed via index signature)
+- Added internal helper `readDcatExtra(dataset, key)` that encapsulates the extras-first, root-fallback lookup
+- Score breakdown markdown and JSON outputs include `holder` and `publisher` per dataset
+- Validated against live `package_search` responses on dati.gov.it: defibrillatori-esterni (Mesagne) 6 → 12, comune-cardioprotetto (Lecce) 10 → 13
+
+## 2026-05-20
+
+### v0.4.104
+
+- Source portal DataStore fallback + LLM error hints (see 2026-05-18 entries below)
+
+## 2026-05-18
+
+- Source portal DataStore fallback: `ckan_list_resources` now probes the source portal when a resource has `datastore_active=false` and its download URL belongs to a different CKAN instance (harvested dataset pattern). Adds `source_datastore_active` and `source_portal_url` fields to output. New `check_source_portal` parameter (default `true`) to skip extra HTTP calls. New `extractSourcePortal()` utility in `url-generator.ts`. Scoped to CKAN-to-CKAN harvesting (detects `/resource/{uuid}/` URL pattern). 12 new tests → 399 total.
+- LLM error hints: add `CkanApiError` class to `makeCkanRequest` (carries `status` + `action`); add `formatCkanError()` with hint table mapping HTTP status/action → actionable suggestion for the LLM (404 datastore → `ckan_package_show`, 404 package → `ckan_package_search`, 400 SQL → check columns, 503 → retry, etc.)
+- Replace raw `error.message` interpolation in all tool catch blocks (datastore, package, organization, group, analyze, portal-discovery, quality) with `formatCkanError()`
+- Replace fragile string-match in `organization.ts` (`includes('CKAN API error (500)')`) with `error instanceof CkanApiError && error.status === 500`
+- Tests: 9 new unit tests for `CkanApiError` and `formatCkanError` → 387 total (381 pass, 6 skipped)
 ## 2026-05-25 (v2)
 
 - Fix (scoring v2): `scoreDatasetRelevance` now reads `holder_name` and `publisher_name` from CKAN dataset `extras[]` first (authoritative DCAT-AP_IT source), with fallback to root-level fields for non-DCAT-AP_IT catalogs

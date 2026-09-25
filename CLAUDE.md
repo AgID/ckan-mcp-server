@@ -21,7 +21,7 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**Important**: This project uses **English** as its primary language. All documentation, code comments, and commit messages should be in English.
+**Important**: This project uses **English** as its primary language. All documentation, code comments, and commit messages should be in English. This includes `LOG.md`, `tasks/`, issues and pull request descriptions — no exceptions.
 
 ## Project Overview
 
@@ -54,7 +54,8 @@ npm run test:coverage
 npm start
 
 # Start server in HTTP mode (for remote access)
-TRANSPORT=http PORT=3000 npm start
+# HTTP requires a domain allowlist (or CKAN_HTTP_ALLOW_ALL=true to opt out)
+CKAN_ALLOWED_DOMAINS="www.dati.gov.it" TRANSPORT=http PORT=3000 npm start
 
 # Watch mode for development
 npm run watch
@@ -152,7 +153,7 @@ When making changes:
 1. Build locally: `npm run build`
 2. Run automated tests: `npm test`
 3. Run real HTTP server tests to verify end-to-end behavior:
-   - Start: `TRANSPORT=http PORT=3001 node dist/index.js & disown`
+   - Start: `CKAN_ALLOWED_DOMAINS="www.dati.gov.it,dati.comune.messina.it" TRANSPORT=http PORT=3001 node dist/index.js & disown`
    - Call each affected tool via curl against a real CKAN portal
    - Stop: `kill $(lsof -ti:3001)`
 
@@ -209,16 +210,16 @@ The server (`src/index.ts`):
    - `tools/datastore.ts`: `ckan_datastore_search`
    - `tools/status.ts`: `ckan_status_show`
 
-3. **MCP Resource Templates** (`resources/`)
+4. **MCP Resource Templates** (`resources/`)
    - `ckan://{server}/dataset/{id}` - Dataset metadata
    - `ckan://{server}/resource/{id}` - Resource metadata
    - `ckan://{server}/organization/{name}` - Organization metadata
 
-4. **Utility Functions** (`utils/`)
+5. **Utility Functions** (`utils/`)
    - `http.ts`: `makeCkanRequest<T>()` - HTTP client for CKAN API v3
    - `formatting.ts`: `truncateText()`, `formatDate()`, `formatBytes()`
 
-5. **Type Definitions** (`types.ts`)
+6. **Type Definitions** (`types.ts`)
    - `ResponseFormat` enum (MARKDOWN, JSON)
    - `ResponseFormatSchema` Zod validator
    - `CHARACTER_LIMIT` constant
@@ -227,15 +228,17 @@ The server (`src/index.ts`):
    - `stdio.ts`: Standard input/output (Claude Desktop)
    - `http.ts`: HTTP server (remote access)
 
-6. **Validation Schema**
+7. **Validation Schema**
    - Uses Zod to validate all tool inputs
    - Each tool has a strict schema that rejects extra parameters
 
-7. **Output Formatting**
+8. **Output Formatting**
    - All tools support two formats: `markdown` (default) and `json`
    - Markdown format optimized for human readability
    - JSON format returns compact objects with only essential fields (~70% token reduction vs raw CKAN API)
-   - JSON truncation is safe: shrinks arrays instead of cutting mid-string (always valid JSON)
+   - JSON truncation is safe: shrinks known arrays, then degrades to a small `{_truncated, _error}` object — never a string cut mid-value (always valid JSON)
+   - Errors respect `response_format`: JSON callers get `{error, _error: true}`, not prose (see `formatError`)
+   - `structuredContent` carries the same capped payload as the text (`jsonToolResult`), so the character limit is not bypassable via the structured channel
    - See `docs/JSON-OUTPUT.md` for complete field schemas
 
 ### Transport Modes
@@ -263,7 +266,7 @@ The server supports three transport modes:
 - Uses `WebStandardStreamableHTTPServerTransport` from MCP SDK
 - Compatible with Workers runtime (no Node.js APIs)
 - Stateless mode (no session management)
-- All 7 tools and 3 resource templates work identically to Node.js version
+- All tools and resource templates work identically to the Node.js version (`/health` reports the current counts: 20 tools, 7 resources, 6 prompts as of v0.4.120)
 
 See `docs/DEPLOYMENT.md` for complete deployment guide.
 
@@ -320,7 +323,6 @@ TypeScript configuration (for IDE):
 The server can connect to any CKAN instance. Some main portals:
 
 - 🇮🇹 https://dati.gov.it (Italy)
-- 🇺🇸 https://catalog.data.gov (United States)
 - 🇨🇦 https://open.canada.ca/data (Canada)
 - 🇬🇧 https://data.gov.uk (United Kingdom)
 - 🌍 https://demo.ckan.org (Official CKAN Demo)
@@ -362,7 +364,7 @@ For manual testing, use HTTP transport with curl:
 ```bash
 # Terminal 1 — start server
 npm run build
-TRANSPORT=http PORT=3001 node dist/index.js
+CKAN_ALLOWED_DOMAINS="www.dati.gov.it" TRANSPORT=http PORT=3001 node dist/index.js
 ```
 
 ```bash
@@ -424,7 +426,8 @@ To test with Claude Desktop, add MCP configuration to config file.
 - **Caching**: Read-through cache in `makeCkanRequest`. Action-based TTL (metadata 300s, datastore 60s, status 3600s). Backend: Cloudflare Cache API on Workers, in-memory LRU on Node. Disable with `CKAN_CACHE_ENABLED=false`. Env vars: `CKAN_CACHE_TTL_DEFAULT`, `CKAN_CACHE_MAX_ENTRIES`, `CKAN_CACHE_MAX_ENTRY_BYTES`.
 - **No authentication**: Uses only public CKAN endpoints
 - **No WebSocket**: MCP over HTTP uses JSON responses (not SSE streaming in Workers)
-- **Domain allowlist**: Optional SSRF hardening via `CKAN_ALLOWED_DOMAINS=domain1.com,domain2.org`. If set, requests to unlisted domains are blocked. Default: no restriction (all public domains allowed). Enforced in `validateServerUrl()`.
+- **SSRF protection** (v0.4.108+): requests are validated against private/internal IP ranges, including hostnames that *resolve* to internal addresses (DNS-based SSRF) — `validateServerUrl()` (string/literal guard) + `isBlockedIp()` + a connection-pinning `lookup` agent on the Node/axios path (`getSafeAgents()`) and, since v0.4.118, an equivalent undici dispatcher on the fetch/SPARQL path (`getSafeDispatcher()`, used by `safeFetch`) so both paths connect to exactly the address they validated — no DNS-rebinding window. `assertHostnameResolvesSafe()` remains as defence in depth where no dispatcher is available (Workers).
+- **Domain allowlist**: `CKAN_ALLOWED_DOMAINS=domain1.com,domain2.org` (comma-separated, default-deny when set). **Mandatory for the HTTP transport**: `TRANSPORT=http` refuses to start without it, unless `CKAN_HTTP_ALLOW_ALL=true` is set (logs a warning). `stdio` is unaffected (no allowlist required). Enforced in `validateServerUrl()` + `assertHttpAllowlistConfigured()`.
 - **Audit logging**: Every `makeCkanRequest` call writes a JSON line to stderr (Node modes only; Workers use `console.log`). Fields: `ts`, `server`, `action`, `cache_hit`, plus relevant query params (`q`, `fq`, `sql` truncated to 200 chars, `id`, `rows`, `limit`).
 
 ### Adding New Tools
@@ -455,18 +458,48 @@ npm cannot resolve relative paths from the tarball.
 
 When releasing a new version:
 
-1. **Update version**: Edit `package.json` version field and `manifest.json` version field
-2. **Update LOG.md**: Add entry with date and changes
-3. **Commit changes**: `git add . && git commit -m "..."`
-4. **Push to GitHub**: `git push origin main`
-5. **Create tag**: `git tag -a v0.x.0 -m "..." && git push origin v0.x.0`
-6. **Build DXT**: `npm run pack:dxt` → produces `ckan-mcp-server.dxt`
-7. **Build skill**: `npm run pack:skill` → produces `tmp/ckan-mcp.skill`
-8. **Attach to release**: `gh release upload v0.x.0 ckan-mcp-server.dxt tmp/ckan-mcp.skill`
-9. **Publish to npm** (optional): `npm publish`
-10. **Deploy to Cloudflare** (if code changed): `npm run deploy`
+1. **Update version**: Edit the version field in `package.json`, `package-lock.json`, `manifest.json`, **`server.json`** (in `server.json` there are **two** fields: top-level `version` and `packages[0].version` — both must match), **`src/server.ts`** (MCP server version) and **`src/worker.ts`** (`/health` response). The two source files are easy to forget: v0.4.119 shipped with them still at 0.4.118. Check with `grep -rn "<old version>" package.json manifest.json server.json src/server.ts src/worker.ts` — it must return nothing
+2. **Run the release gate**: `npm run smoke` — known-answer search queries against live portals, asserting *which* dataset comes back rather than how many. It must be green before tagging. It exists because v0.4.122 shipped with counts verified and ranking broken: "22 results" and "the right dataset first" are different claims
+3. **Update LOG.md**: Add entry with date and changes
+4. **Commit changes on a branch**: `git checkout -b <type>/<description>` then `git add . && git commit -m "..."`. Code never goes straight to `main`; documentation-only changes may.
+5. **Open a PR and merge it**: `git push -u origin <branch>`, `gh pr create`, wait for green checks, `gh pr merge --squash --delete-branch`, then `git checkout main && git pull`. `main` has a `non_fast_forward` rule: a commit pushed there by mistake needs a revert, not a force-push.
+6. **Create tag**: `git tag -a v0.x.0 -m "..." && git push origin v0.x.0` — ⚠️ **this triggers the npm publish**, see step 10
+7. **Build DXT**: `npm run pack:dxt` → produces `ckan-mcp-server.dxt`
+8. **Build skill**: `npm run pack:skill` → produces `tmp/ckan-mcp.skill`
+9. **Attach to release**: `gh release upload v0.x.0 ckan-mcp-server.dxt tmp/ckan-mcp.skill`
+10. **npm publish happens automatically**: pushing the tag in step 6 starts `.github/workflows/release.yml`, which verifies the tag matches `package.json`, builds, tests, and runs `npm publish --provenance`. **Do not run `npm publish` by hand** — the two paths collide and the loser gets `EPUBLISHCONFLICT`. Watch the run: `gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')`
+11. **Publish to the MCP Registry** — only **after** the step 10 run has finished green, since the registry validates that the npm version exists: `mcp-publisher login github && mcp-publisher publish`. If login fails with `incorrect_device_code`, the local binary is stale: compare `mcp-publisher --version` against the [latest release](https://github.com/modelcontextprotocol/registry/releases) and update it — the device-auth flow has changed between versions, and the error does not say so
+12. **Deploy to Cloudflare** (if code changed): `npm run deploy`
 
 See `docs/DEPLOYMENT.md` for detailed Cloudflare deployment instructions.
+
+**Why steps 1 and 11 matter**: `server.json` feeds the official MCP Registry entry, which is what clients installing via the registry resolve. It is *not* updated by `npm publish`. Skipping it silently pins public installs to an old version: between v0.4.83 (2026-03-12) and v0.4.114 (2026-08-03) the registry advertised a build predating the v0.4.108 SSRF remediation, while npm was current. Verify after publishing:
+
+```bash
+curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.aborruso/ckan-mcp-server" | \
+  jq -r '.servers[] | select(.server.name|test("aborruso")) | "\(.server.version) | pkg \(.server.packages[0].version) | latest \(._meta["io.modelcontextprotocol.registry/official"].isLatest)"'
+```
+
+### npm Provenance
+
+Releases are published from CI with [npm provenance](https://docs.npmjs.com/generating-provenance-statements) (Sigstore), so every tarball carries a signed attestation binding it to the commit and workflow run that built it. Adopters see a "Provenance" badge on the npm page and can verify the package really came from this repository — the supply-chain equivalent of the registry alignment above.
+
+Authentication uses **trusted publishing (OIDC)**, not a token: no `NPM_TOKEN` secret exists and none should be created. Each publish authenticates with a short-lived, workflow-specific credential that cannot be exfiltrated or reused, which also sidesteps npm's ongoing restriction of 2FA-bypassing tokens for direct publishing.
+
+Requirements:
+
+- **Trusted publisher configured on npmjs.com** (one-off, manual): package page → *Settings* → *Trusted Publisher* → GitHub Actions → organization `ondata`, repository `ckan-mcp-server`, workflow `release.yml`, no environment. **The workflow is inert until this is done.**
+- `id-token: write` permission in `release.yml` (set)
+- a `repository` field in `package.json` matching this repo (set)
+- npm ≥ 11.5.1 in CI — the workflow upgrades npm explicitly, because Node 22 ships npm 10.x and **older versions fall back to token auth silently**, publishing without provenance
+
+⚠️ The workflow **filename** is part of the trusted-publisher identity. Renaming `release.yml` breaks publishing with a non-obvious error; rename it on npmjs.com first.
+
+Verify after a release:
+
+```bash
+npm view @aborruso/ckan-mcp-server@<version> dist.attestations
+```
 
 ## CSV Data Exploration
 

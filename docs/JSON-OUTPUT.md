@@ -6,7 +6,11 @@ JSON responses are **compact**: they include only essential fields, dropping ext
 
 ## Truncation
 
-JSON output uses safe truncation (`truncateJson`): when a response exceeds the 50K character limit, it shrinks known arrays (results, records, resources, packages) instead of cutting mid-string. This guarantees valid JSON output.
+JSON output uses safe truncation (`truncateJson`): when a response exceeds the 50K character limit, it shrinks known arrays (`results`, `records`, `rows`, `datasets`, `resources`, `packages`, `organizations`, `groups`, `portals`, `tags`, `facets`, `fields`, in that sacrifice order) instead of cutting mid-string, flagging the result with `_truncated: true` and `_original_count`. If shrinking is not enough — a single oversized element, or no shrinkable key at all — the payload is replaced by a small `{_truncated: true, _error: "..."}` object. The output always parses as JSON.
+
+Error paths respect the requested format too: with `response_format: "json"` a failure returns `{"error": "...", "_error": true}` and `isError: true`, never bare prose. Note that Zod input-validation failures are emitted by the MCP SDK before the tool handler runs, so those remain plain text.
+
+`structuredContent`, where present, carries the **same capped payload** as the text: it is the parsed form of the truncated JSON, so the two channels cannot disagree and `_truncated`/`_original_count` reach structured readers too. Tools whose text channel is Markdown — `ckan_status_show` and `ckan_find_portals` — have no truncated JSON to derive the structured payload from, so they cap it on its own via `cappedStructured()`. The only responses outside the cap are the `all_fields=false` branches of `ckan_organization_list`/`ckan_group_list`, which return a single integer count and have nothing to shrink.
 
 ---
 
@@ -35,6 +39,7 @@ JSON output uses safe truncation (`truncateJson`): when a response exceeds the 5
 | Field | Type | Notes |
 |-------|------|-------|
 | `count` | number | Total matching datasets |
+| `effective_query` | string | Present **only when the server rewrote the query** — the caller sent `aria OR acqua` and Solr received `text:(aria OR acqua)`. Absent when the query ran unchanged, which is the common case. The Markdown format has always shown this as **Effective Query**. |
 | `results[].id` | string | Dataset UUID |
 | `results[].name` | string | Machine-readable slug |
 | `results[].title` | string | Human-readable title (falls back to name) |
@@ -71,6 +76,7 @@ JSON output uses safe truncation (`truncateJson`): when a response exceeds the 5
   "modified": "2026-02-28",
   "author": "Author Name",
   "maintainer": "Maintainer Name",
+  "temporal_coverage": [{ "start": "2024-01-01", "end": "2024-12-31", "start_equals_issued": false }],
   "resources": [
     {
       "id": "uuid",
@@ -102,6 +108,7 @@ JSON output uses safe truncation (`truncateJson`): when a response exceeds the 5
 | `modified` | string\|null | Content update date (may be absent) |
 | `author` | string\|null | |
 | `maintainer` | string\|null | |
+| `temporal_coverage` | array | Every `dct:temporal` period as `{ start, end, start_equals_issued }` (root `temporal_coverage` or extras `temporal_start`/`temporal_end`); empty when absent. `start_equals_issued` is true when start = `issued` and there is no end. On dcatapit portals (most Italian ones) that shape is an export default emitted when the publisher left coverage empty, so it is a publish date rather than a data period; other portals may mean it |
 | `resources[].id` | string | Resource UUID |
 | `resources[].name` | string\|null | |
 | `resources[].format` | string\|null | e.g. "CSV", "JSON" |
@@ -275,3 +282,15 @@ These tools already return minimal JSON and were not changed:
 - `ckan_analyze_datasets` — statistical summary
 - `ckan_catalog_stats` — aggregate counts
 - `ckan_status_show` — portal status
+
+## ckan_find_relevant_datasets
+
+Only the fields added on 2026-09-06 are listed here; the rest of the payload mirrors the Markdown view.
+
+| Field | Type | Description |
+|---|---|---|
+| `all_terms_results` | number \| null | How many datasets the portal returned with **every** query term required (Solr `mm=100%`). Those candidates are fetched first and carry the `coverage` bonus. `null` when the strict pass was skipped — fielded, wrapped or boolean queries are sent as written — or when the portal rejected `mm`. |
+| `total_results` | number | Unchanged: how many datasets match the query on the portal's default search. |
+| `results[].breakdown.coverage` | number | The `coverage` weight (default 4) for a dataset from the strict pass, 0 otherwise. |
+| `weights.coverage` | number | Settable like the other weights. |
+

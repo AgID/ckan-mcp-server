@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
+import type { AddressInfo } from 'node:net';
 import axios from 'axios';
-import { makeCkanRequest, validateServerUrl } from '../../src/utils/http';
+import { makeCkanRequest, validateServerUrl, CkanApiError, formatCkanError, isBlockedIp, createSsrfSafeLookup, assertHttpAllowlistConfigured, assertHostnameResolvesSafe, getSafeDispatcher, __setDnsResolverForTests } from '../../src/utils/http';
 import { __resetCacheForTests } from '../../src/utils/cache';
 import successResponse from '../fixtures/responses/status-success.json';
 
@@ -64,8 +65,286 @@ describe('validateServerUrl', () => {
     expect(() => validateServerUrl('http://[fe80::1]')).toThrow('private/internal');
   });
 
+  it('blocks ip6-localhost (SSRF bypass via /etc/hosts alias)', () => {
+    expect(() => validateServerUrl('http://ip6-localhost:8080/api')).toThrow('not allowed');
+  });
+
+  it('blocks ip6-loopback (SSRF bypass via /etc/hosts alias)', () => {
+    expect(() => validateServerUrl('http://ip6-loopback/api')).toThrow('not allowed');
+  });
+
   it('throws on invalid URL', () => {
     expect(() => validateServerUrl('not-a-url')).toThrow('Invalid URL');
+  });
+
+  it('blocks internal IPs in non-dotted encodings (URL normalizes them) — GHSA-8hxx', () => {
+    // WHATWG URL normalizes integer/hex/octal/short IPv4 to dotted-decimal.
+    for (const u of [
+      'http://2130706433/',       // 127.0.0.1 as integer
+      'http://0x7f000001/',       // 127.0.0.1 as hex
+      'http://0177.0.0.1/',       // 127.x octal first octet
+      'http://127.1/',            // short form
+      'http://2852039166/',       // 169.254.169.254 as integer
+    ]) {
+      expect(() => validateServerUrl(u), u).toThrow('private/internal');
+    }
+  });
+});
+
+describe('isBlockedIp', () => {
+  it('blocks IPv4 loopback / private / special ranges', () => {
+    for (const ip of ['127.0.0.1', '127.0.0.2', '10.0.0.1', '172.16.0.1', '172.31.255.255',
+                       '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '255.255.255.255']) {
+      expect(isBlockedIp(ip), ip).toBe(true);
+    }
+  });
+
+  it('allows public IPv4', () => {
+    for (const ip of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '172.15.0.1', '172.32.0.1', '100.63.0.1']) {
+      expect(isBlockedIp(ip), ip).toBe(false);
+    }
+  });
+
+  it('blocks IPv6 loopback / unique-local / link-local / mapped', () => {
+    for (const ip of ['::1', '::', 'fc00::1', 'fd12::1', 'fe80::1', '::ffff:127.0.0.1']) {
+      expect(isBlockedIp(ip), ip).toBe(true);
+    }
+  });
+
+  it('allows public IPv6', () => {
+    expect(isBlockedIp('2606:4700:4700::1111')).toBe(false);
+  });
+
+  // GHSA-x32r-mh7g-q2rf: IPv6 ranges that embed an IPv4 address reached internal
+  // hosts because the classifier only prefix-matched a handful of spellings.
+  it('blocks IPv6 ranges embedding IPv4 (NAT64 / 6to4 / IPv4-compatible)', () => {
+    for (const ip of [
+      '64:ff9b::a9fe:a9fe',    // NAT64 well-known -> 169.254.169.254 (cloud metadata)
+      '64:ff9b::a00:1',        // NAT64 -> 10.0.0.1
+      '64:ff9b:1::a9fe:a9fe',  // NAT64 local-use -> metadata
+      '2002:7f00:1::',         // 6to4 -> 127.0.0.1
+      '2002:c0a8:101::',       // 6to4 -> 192.168.1.1
+      '::127.0.0.1',           // IPv4-compatible loopback
+      '::192.168.1.1',         // IPv4-compatible private
+      '::a9fe:a9fe',           // IPv4-compatible metadata
+      '2001::1'                // Teredo (hardening, not part of the bypass)
+    ]) {
+      expect(isBlockedIp(ip), ip).toBe(true);
+    }
+  });
+
+  it('classifies on parsed words, not on how the address is spelled', () => {
+    for (const ip of ['0064:ff9b::a9fe:a9fe', '64:FF9B:0:0:0:0:A9FE:A9FE',
+                      '64:ff9b:0000:0000:0000:0000:a9fe:a9fe', '0:0:0:0:0:0:a9fe:a9fe']) {
+      expect(isBlockedIp(ip), ip).toBe(true);
+    }
+    // public addresses survive the same spellings
+    expect(isBlockedIp('2606:4700:4700:0000:0000:0000:0000:1111')).toBe(false);
+  });
+
+  it('fails CLOSED on an unparseable IPv6 literal', () => {
+    for (const ip of ['::ffff::1', '1:2:3:4:5:6:7:8:9', 'fe80::gggg', '64:ff9b::1.2.3.999']) {
+      expect(isBlockedIp(ip), ip).toBe(true);
+    }
+  });
+
+  it('blocks the IPv4 benchmarking range 198.18.0.0/15', () => {
+    expect(isBlockedIp('198.18.0.1')).toBe(true);
+    expect(isBlockedIp('198.19.255.255')).toBe(true);
+    expect(isBlockedIp('198.17.0.1')).toBe(false);
+    expect(isBlockedIp('198.20.0.1')).toBe(false);
+  });
+
+  it("blocks multicast, reserved and site-local ranges", () => {
+    for (const ip of ["224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255", "ff00::1", "ff02::1", "fec0::1", "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"]) {
+      expect(isBlockedIp(ip), ip).toBe(true);
+    }
+    expect(isBlockedIp("223.255.255.254")).toBe(false);
+  });
+});
+
+describe('GHSA-x32r-mh7g-q2rf bypass chain', () => {
+  afterEach(() => __setDnsResolverForTests(null));
+
+  it('literal guard rejects an IPv6 literal embedding cloud metadata', () => {
+    expect(() => validateServerUrl('http://[64:ff9b::a9fe:a9fe]/')).toThrow('private/internal');
+    expect(() => validateServerUrl('http://[2002:c0a8:101::]/api/3')).toThrow('private/internal');
+  });
+
+  it('DNS guard rejects a hostname whose AAAA record is a NAT64 metadata address', async () => {
+    __setDnsResolverForTests(async () => [{ address: '64:ff9b::a9fe:a9fe', family: 6 }]);
+    await expect(assertHostnameResolvesSafe('nat64.evil')).rejects.toThrow('private/internal');
+  });
+
+  it('connection-time lookup rejects the same AAAA record', async () => {
+    const lookup = createSsrfSafeLookup({
+      lookup: (_h: string, _o: any, cb: any) => cb(null, [{ address: '64:ff9b::a9fe:a9fe', family: 6 }])
+    } as any);
+    await expect(new Promise((resolve, reject) =>
+      lookup('nat64.evil', {}, (err: any, addr: any) => err ? reject(err) : resolve(addr))))
+      .rejects.toThrow('private/internal');
+  });
+});
+
+describe('assertHostnameResolvesSafe', () => {
+  afterEach(() => __setDnsResolverForTests(null));
+
+  it('passes for a hostname resolving to a public IP', async () => {
+    __setDnsResolverForTests(async () => [{ address: '93.184.216.34', family: 4 }]);
+    await expect(assertHostnameResolvesSafe('example.com')).resolves.toBeUndefined();
+  });
+
+  it('throws when a hostname resolves to an internal IP', async () => {
+    __setDnsResolverForTests(async () => [{ address: '169.254.169.254', family: 4 }]);
+    await expect(assertHostnameResolvesSafe('metadata.evil')).rejects.toThrow('private/internal');
+  });
+
+  it('fails CLOSED when DNS resolution errors (does not proceed)', async () => {
+    __setDnsResolverForTests(async () => { throw new Error('ENOTFOUND'); });
+    await expect(assertHostnameResolvesSafe('unresolvable.example')).rejects.toThrow('failing closed');
+  });
+});
+
+describe('createSsrfSafeLookup', () => {
+  const fakeDns = (addresses: { address: string; family?: number }[]) => ({
+    lookup: (_h: string, _o: any, cb: any) => cb(null, addresses)
+  });
+
+  it('passes through when all resolved addresses are public', async () => {
+    const lookup = createSsrfSafeLookup(fakeDns([{ address: '93.184.216.34', family: 4 }]));
+    const result = await new Promise<any>((resolve, reject) =>
+      lookup('example.com', {}, (err: any, addr: any, fam: any) => err ? reject(err) : resolve({ addr, fam })));
+    expect(result.addr).toBe('93.184.216.34');
+  });
+
+  it('rejects when the hostname resolves to an internal IP (DNS-name bypass)', async () => {
+    const lookup = createSsrfSafeLookup(fakeDns([{ address: '127.0.0.1', family: 4 }]));
+    await expect(new Promise((resolve, reject) =>
+      lookup('evil.lvh.me', {}, (err: any, addr: any) => err ? reject(err) : resolve(addr))))
+      .rejects.toThrow('private/internal');
+  });
+
+  it('rejects when ANY resolved address is internal (rebinding multi-record)', async () => {
+    const lookup = createSsrfSafeLookup(fakeDns([{ address: '93.184.216.34', family: 4 }, { address: '169.254.169.254', family: 4 }]));
+    await expect(new Promise((resolve, reject) =>
+      lookup('mixed.example', {}, (err: any, addr: any) => err ? reject(err) : resolve(addr))))
+      .rejects.toThrow('private/internal');
+  });
+});
+
+type LookupOptions = { all?: boolean; family?: number };
+type LookupCallback = (
+  err: NodeJS.ErrnoException | null,
+  addresses: { address: string; family: number }[]
+) => void;
+
+describe('getSafeDispatcher', () => {
+  it('returns a memoized undici dispatcher on Node', async () => {
+    const dispatcher: any = await getSafeDispatcher();
+    expect(dispatcher).toBeTruthy();
+    expect(typeof dispatcher.dispatch).toBe('function');
+    expect(await getSafeDispatcher()).toBe(dispatcher);
+  });
+
+  // A listener on loopback plus a DNS module we control: if a request ever reaches
+  // `hits`, the guard let a connection through to an internal address.
+  const withLoopbackListener = async (
+    run: (port: number, hits: () => number) => Promise<void>
+  ) => {
+    const http = await import('node:http');
+    let hits = 0;
+    const server = http.createServer((_req, res) => { hits++; res.end('reached'); });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
+    const { port } = server.address() as AddressInfo;
+    try {
+      await run(port, () => hits);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  };
+
+  const scriptedDns = (answers: string[]) => {
+    let calls = 0;
+    return {
+      calls: () => calls,
+      lookup: (_hostname: string, options: LookupOptions | undefined, callback: LookupCallback) => {
+        const address = answers[Math.min(calls, answers.length - 1)];
+        calls++;
+        callback(null, [{ address, family: 4 }]);
+      }
+    };
+  };
+
+  it('rejects a fetch whose hostname resolves to loopback, with a live listener there', async () => {
+    const { Agent } = await import('undici');
+    await withLoopbackListener(async (port, hits) => {
+      const dns = scriptedDns(['127.0.0.1']);
+      const dispatcher = new Agent({ connect: { lookup: createSsrfSafeLookup(dns) } });
+      try {
+        await expect(
+          fetch(`http://loopback.example:${port}/`, { dispatcher } as unknown as RequestInit)
+        ).rejects.toThrow();
+        expect(hits()).toBe(0);
+      } finally {
+        await dispatcher.close();
+      }
+    });
+  });
+
+  it('pins the connection to the first resolution, so rebinding cannot swap in loopback', async () => {
+    const { Agent } = await import('undici');
+    await withLoopbackListener(async (port, hits) => {
+      // First answer is public (192.0.2.1, TEST-NET-1: allowed but unroutable), every
+      // later answer is the loopback the listener sits on. A second resolution would
+      // land on the listener; pinning means there is no second resolution.
+      const dns = scriptedDns(['192.0.2.1', '127.0.0.1']);
+      const dispatcher = new Agent({
+        connect: { lookup: createSsrfSafeLookup(dns), timeout: 500 }
+      });
+      try {
+        await expect(
+          fetch(`http://rebind.example:${port}/`, {
+            dispatcher,
+            signal: AbortSignal.timeout(3000)
+          } as unknown as RequestInit)
+        ).rejects.toThrow();
+        expect(dns.calls()).toBe(1);
+        expect(hits()).toBe(0);
+      } finally {
+        await dispatcher.close();
+      }
+    });
+  });
+});
+
+describe('assertHttpAllowlistConfigured', () => {
+  const origAllowed = process.env.CKAN_ALLOWED_DOMAINS;
+  const origAllowAll = process.env.CKAN_HTTP_ALLOW_ALL;
+
+  afterEach(() => {
+    if (origAllowed === undefined) delete process.env.CKAN_ALLOWED_DOMAINS; else process.env.CKAN_ALLOWED_DOMAINS = origAllowed;
+    if (origAllowAll === undefined) delete process.env.CKAN_HTTP_ALLOW_ALL; else process.env.CKAN_HTTP_ALLOW_ALL = origAllowAll;
+  });
+
+  it('throws when no allowlist and no opt-out', () => {
+    delete process.env.CKAN_ALLOWED_DOMAINS;
+    delete process.env.CKAN_HTTP_ALLOW_ALL;
+    expect(() => assertHttpAllowlistConfigured()).toThrow('Refusing to start HTTP transport');
+  });
+
+  it('passes when allowlist is set', () => {
+    process.env.CKAN_ALLOWED_DOMAINS = 'www.dati.gov.it';
+    delete process.env.CKAN_HTTP_ALLOW_ALL;
+    expect(() => assertHttpAllowlistConfigured()).not.toThrow();
+  });
+
+  it('passes (with warning) when explicit opt-out is set', () => {
+    delete process.env.CKAN_ALLOWED_DOMAINS;
+    process.env.CKAN_HTTP_ALLOW_ALL = 'true';
+    const warn = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => assertHttpAllowlistConfigured()).not.toThrow();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
 
@@ -160,6 +439,15 @@ describe('makeCkanRequest', () => {
     );
   });
 
+  it("disables environment proxies so the SSRF-safe lookup pins the real target", async () => {
+    vi.mocked(axios.get).mockResolvedValue({ data: successResponse });
+
+    await makeCkanRequest("https://www.dati.gov.it/opendata", "ckan_status_show");
+
+    const axiosCall = vi.mocked(axios.get).mock.calls[0];
+    expect(axiosCall[1].proxy).toBe(false);
+  });
+
   it('throws error when success=false in response', async () => {
     vi.mocked(axios.get).mockResolvedValue({
       data: {
@@ -171,6 +459,24 @@ describe('makeCkanRequest', () => {
     await expect(
       makeCkanRequest('http://demo.ckan.org', 'ckan_status_show')
     ).rejects.toThrow('CKAN API returned success=false');
+  });
+
+  it('does NOT reflect the upstream body in the success=false error (GHSA-6f9w)', async () => {
+    vi.mocked(axios.get).mockResolvedValue({
+      data: {
+        success: false,
+        error: { message: 'SECRET_INTERNAL_DETAIL_10.0.0.5' }
+      }
+    });
+
+    let caught: unknown;
+    try {
+      await makeCkanRequest('http://demo.ckan.org', 'ckan_status_show');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).not.toContain('SECRET_INTERNAL_DETAIL');
   });
 
   it('decodes gzip-compressed buffer payload', async () => {
@@ -225,7 +531,7 @@ describe('makeCkanRequest', () => {
     expect(result).toEqual(successResponse.result);
   });
 
-  it('throws CKAN API error with status and message from response', async () => {
+  it('throws CkanApiError with status and action from HTTP 4xx response', async () => {
     const axiosError = {
       response: {
         status: 400,
@@ -236,31 +542,44 @@ describe('makeCkanRequest', () => {
     vi.mocked(axios.isAxiosError).mockReturnValue(true);
     vi.mocked(axios.get).mockRejectedValue(axiosError);
 
-    await expect(
-      makeCkanRequest('http://demo.ckan.org', 'ckan_status_show')
-    ).rejects.toThrow('CKAN API error (400): Bad request');
+    const err = await makeCkanRequest('http://demo.ckan.org', 'datastore_search').catch(e => e);
+    expect(err).toBeInstanceOf(CkanApiError);
+    expect((err as CkanApiError).status).toBe(400);
+    expect((err as CkanApiError).action).toBe('datastore_search');
+    expect(err.message).toContain('CKAN API error (400)');
   });
 
-  it('throws timeout error when request exceeds timeout', async () => {
+  it('throws CkanApiError with status=undefined for success=false response', async () => {
+    vi.mocked(axios.get).mockResolvedValue({
+      data: { success: false, error: { message: 'not found' } }
+    });
+
+    const err = await makeCkanRequest('http://demo.ckan.org', 'package_show').catch(e => e);
+    expect(err).toBeInstanceOf(CkanApiError);
+    expect((err as CkanApiError).status).toBeUndefined();
+    expect((err as CkanApiError).action).toBe('package_show');
+  });
+
+  it('throws plain Error (not CkanApiError) for timeout', async () => {
     const axiosError = { code: 'ECONNABORTED' };
 
     vi.mocked(axios.isAxiosError).mockReturnValue(true);
     vi.mocked(axios.get).mockRejectedValue(axiosError);
 
-    await expect(
-      makeCkanRequest('http://demo.ckan.org', 'ckan_status_show')
-    ).rejects.toThrow('Request timeout connecting to http://demo.ckan.org');
+    const err = await makeCkanRequest('http://demo.ckan.org', 'ckan_status_show').catch(e => e);
+    expect(err).not.toBeInstanceOf(CkanApiError);
+    expect(err.message).toContain('Request timeout connecting to http://demo.ckan.org');
   });
 
-  it('throws not found error when server cannot be resolved', async () => {
+  it('throws plain Error (not CkanApiError) for ENOTFOUND', async () => {
     const axiosError = { code: 'ENOTFOUND' };
 
     vi.mocked(axios.isAxiosError).mockReturnValue(true);
     vi.mocked(axios.get).mockRejectedValue(axiosError);
 
-    await expect(
-      makeCkanRequest('http://demo.ckan.org', 'ckan_status_show')
-    ).rejects.toThrow('Server not found: http://demo.ckan.org');
+    const err = await makeCkanRequest('http://demo.ckan.org', 'ckan_status_show').catch(e => e);
+    expect(err).not.toBeInstanceOf(CkanApiError);
+    expect(err.message).toContain('Server not found: http://demo.ckan.org');
   });
 
   it('throws network error for other axios errors', async () => {
@@ -444,5 +763,99 @@ describe('audit logging', () => {
     const log = JSON.parse(String(writeSpy.mock.calls[0][0]).trim());
     expect((log.sql as string).length).toBeLessThanOrEqual(200);
     writeSpy.mockRestore();
+  });
+});
+
+describe('formatCkanError', () => {
+  it('a migrated portal gets the migration notice, whatever the status', () => {
+    // catalog.data.gov left CKAN in 2025 and answers every action with a bare 404:
+    // no status-based hint can be right for it, so the notice takes precedence.
+    for (const status of [404, 500, undefined]) {
+      const err = new CkanApiError('CKAN API error (404): Not Found', status, 'package_search', 'https://catalog.data.gov');
+      const result = formatCkanError(err, 'ckan_package_search');
+      expect(result).toContain('stopped being a CKAN portal');
+      expect(result).toContain('https://resources.data.gov/catalog-api/');
+      // The raw message stays, as with every other hint; what must not follow it is a
+      // status-based hint that would be wrong for this portal.
+      expect(result).not.toContain('retry later');
+      expect(result).not.toContain('ckan_package_search');
+    }
+  });
+
+  it('a working portal keeps the status-based hint', () => {
+    const err = new CkanApiError('CKAN API error (500): Internal Server Error', 500, 'package_search', 'https://open.canada.ca/data');
+    const result = formatCkanError(err, 'ckan_package_search');
+    expect(result).toContain('internal error');
+    expect(result).not.toContain('stopped being');
+  });
+
+  it('an error without a portal URL behaves as before', () => {
+    const err = new CkanApiError('CKAN API error (404): Not Found', 404, 'package_show');
+    expect(err.serverUrl).toBeUndefined();
+    expect(formatCkanError(err, 'ckan_package_show')).toContain('ckan_package_search');
+  });
+
+  it('404 on datastore_search mentions ckan_package_show and datastore_active', () => {
+    const err = new CkanApiError('CKAN API error (404): Not Found', 404, 'datastore_search');
+    const result = formatCkanError(err, 'ckan_datastore_search');
+    expect(result).toContain('ckan_package_show');
+    expect(result).toContain('datastore_active');
+  });
+
+  it('404 on datastore_search_sql says the portal lacks the SQL endpoint, not that the resource_id is wrong', () => {
+    const err = new CkanApiError('CKAN API error (404): Not Found', 404, 'datastore_search_sql');
+    const result = formatCkanError(err, 'ckan_datastore_search_sql');
+    expect(result).toContain('does not expose the SQL endpoint');
+    expect(result).toContain('ckan_datastore_search');
+    // the old hint sent the caller to package_show, which returns the same
+    // resource_id and loops straight back into this 404
+    expect(result).not.toContain('ckan_package_show');
+  });
+
+  it('404 on package_show mentions ckan_package_search', () => {
+    const err = new CkanApiError('CKAN API error (404): Not Found', 404, 'package_show');
+    const result = formatCkanError(err, 'ckan_package_show');
+    expect(result).toContain('ckan_package_search');
+  });
+
+  it('404 on organization_show mentions ckan_organization_list', () => {
+    const err = new CkanApiError('CKAN API error (404): Not Found', 404, 'organization_show');
+    const result = formatCkanError(err, 'ckan_organization_show');
+    expect(result).toContain('ckan_organization_list');
+  });
+
+  it('400 on datastore_search_sql mentions ckan_datastore_search', () => {
+    const err = new CkanApiError('CKAN API error (400): Bad Request', 400, 'datastore_search_sql');
+    const result = formatCkanError(err, 'ckan_datastore_search_sql');
+    expect(result).toContain('ckan_datastore_search');
+  });
+
+  it('503 mentions retry', () => {
+    const err = new CkanApiError('CKAN API error (503): Service Unavailable', 503, 'package_search');
+    const result = formatCkanError(err, 'ckan_package_search');
+    expect(result).toContain('retry');
+  });
+
+  it('500 mentions portal internal error', () => {
+    const err = new CkanApiError('CKAN API error (500): Internal Server Error', 500, 'package_search');
+    const result = formatCkanError(err, 'ckan_package_search');
+    expect(result).toContain('internal error');
+  });
+
+  it('status=undefined mentions success=false', () => {
+    const err = new CkanApiError('CKAN API returned success=false: {}', undefined, 'organization_list');
+    const result = formatCkanError(err, 'ckan_organization_list');
+    expect(result).toContain('success=false');
+  });
+
+  it('plain Error returns original message unchanged', () => {
+    const err = new Error('network failure');
+    const result = formatCkanError(err, 'any_tool');
+    expect(result).toBe('network failure');
+  });
+
+  it('non-Error value returns String()', () => {
+    const result = formatCkanError('something went wrong', 'any_tool');
+    expect(result).toBe('something went wrong');
   });
 });

@@ -160,34 +160,18 @@ ckan_get_mqa_quality({
 })
 ```
 
-Returns quality score and detailed metrics from data.europa.eu MQA (Metadata Quality Assurance) system:
-- Overall score (max 405 points)
-- Accessibility (URL status, download availability)
-- Reusability (license, contact point, publisher)
-- Interoperability (format, media type)
-- Findability (keywords, category, spatial/temporal coverage)
+Returns the quality score from the data.europa.eu MQA (Metadata Quality Assessment), [methodology v2](https://data.europa.eu/mqa/methodology):
+- Final score on a 0-7.5 scale and its band (Sufficient < 2.5 ≤ Good < 5 ≤ Excellent)
+- Dataset score, distribution average and data service average
+- The failing metrics with the largest gain on the final score (DCAT-AP property, weight, how many distributions fail it)
 
-**Note**: Only works with dati.gov.it datasets. Uses the `identifier` field (or falls back to `name`) to query the European MQA API.
+`ckan_get_mqa_quality_details` lists every failing metric grouped by FAIR dimension (findability, accessibility, interoperability, reusability).
 
-## USA Examples - data.gov
+**Note**: Only works with dati.gov.it datasets. Uses the `identifier` field (or falls back to `name`) to query the European MQA API. Datasets that data.europa.eu has not re-evaluated with v2 yet are reported with the previous methodology (405-point scale), labelled as such.
 
-### Search government datasets
-```typescript
-ckan_package_search({
-  server_url: "https://catalog.data.gov",
-  q: "climate change",
-  rows: 20
-})
-```
+## USA - data.gov
 
-### Datasets by tag
-```typescript
-ckan_package_search({
-  server_url: "https://catalog.data.gov",
-  q: "tags:health",
-  rows: 20
-})
-```
+`catalog.data.gov` stopped being a CKAN portal in 2025: Data.gov now serves its catalog through a different API (`api.gsa.gov/technology/datagov/v4`, key required, not CKAN-compatible). A call to it returns an error that says so. See [#540](https://github.com/ondata/ckan-mcp-server/issues/540).
 
 ## CKAN Demo Examples
 

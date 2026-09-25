@@ -8,8 +8,16 @@ import { createServer, registerAll } from "./server.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { getLastCacheHit } from "./utils/http.js";
 
+interface AnalyticsEngineDataset {
+  writeDataPoint(event: { blobs?: string[]; doubles?: number[]; indexes?: string[] }): void;
+}
+
+interface Env {
+  ANALYTICS?: AnalyticsEngineDataset;
+}
+
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     // Root endpoint - README
@@ -212,7 +220,7 @@ export default {
     if (request.method === 'GET' && url.pathname === '/health') {
       return new Response(JSON.stringify({
         status: 'ok',
-        version: '0.4.103',
+        version: '0.4.127',
         tools: 20,
         resources: 7,
         prompts: 6,
@@ -319,12 +327,41 @@ export default {
           }
         } catch { /* ignore parse errors (e.g. non-JSON requests) */ }
 
+        const t0 = Date.now();
         const response = await transport.handleRequest(request);
+        const durationMs = Date.now() - t0;
 
         if (logEntry) {
           const cacheHit = getLastCacheHit();
           if (cacheHit !== null) logEntry['cache_hit'] = cacheHit;
+          logEntry['duration_ms'] = durationMs;
+
+          let callStatus = 'ok';
+          try {
+            const rj = await response.clone().json() as Record<string, unknown>;
+            const result = rj?.result as Record<string, unknown> | undefined;
+            if (result?.isError || rj?.error) callStatus = 'error';
+          } catch { /* ignore */ }
+          logEntry['status'] = callStatus;
+
           console.log(JSON.stringify(logEntry));
+
+          if (env.ANALYTICS) {
+            env.ANALYTICS.writeDataPoint({
+              blobs: [
+                String(logEntry['tool']    ?? ''),
+                String(logEntry['server']  ?? ''),
+                String(logEntry['q'] ?? logEntry['query'] ?? logEntry['id'] ?? ''),
+                callStatus,
+                String(logEntry['country'] ?? ''),
+              ],
+              doubles: [
+                durationMs,
+                cacheHit ? 1 : 0,
+              ],
+              indexes: [String(logEntry['tool'] ?? '')],
+            });
+          }
         }
 
         // Add CORS headers and service notices
@@ -339,13 +376,14 @@ export default {
           headers
         });
       } catch (error) {
+        // Log full detail server-side; return a generic message to the caller so
+        // internal exception text (hostnames, IPs, stack fragments) is not leaked (GHSA-6f9w).
         console.error('Worker error:', error);
         return new Response(JSON.stringify({
           jsonrpc: '2.0',
           error: {
             code: -32603,
-            message: 'Internal error',
-            data: error instanceof Error ? error.message : String(error)
+            message: 'Internal error'
           },
           id: null
         }), {

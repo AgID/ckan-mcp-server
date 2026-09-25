@@ -3,7 +3,7 @@
  */
 
 import axios, { AxiosError } from "axios";
-import { getPortalApiUrlForHostname, getPortalApiPath } from "./portal-config.js";
+import { getPortalApiUrlForHostname, getPortalApiPath, getPortalMigration } from "./portal-config.js";
 import {
   buildCacheKey,
   getCache,
@@ -20,6 +20,67 @@ export interface MakeCkanRequestOptions {
   rateLimit?: boolean;
 }
 
+export class CkanApiError extends Error {
+  readonly status: number | undefined;
+  readonly action: string;
+  /** The portal the request went to, as the caller wrote it: lets the hint know its origin. */
+  readonly serverUrl: string | undefined;
+  constructor(message: string, status: number | undefined, action: string, serverUrl?: string) {
+    super(message);
+    this.name = 'CkanApiError';
+    this.status = status;
+    this.action = action;
+    this.serverUrl = serverUrl;
+  }
+}
+
+export function formatCkanError(error: unknown, _toolName: string): string {
+  if (!(error instanceof CkanApiError)) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  const { status, action, message, serverUrl } = error;
+
+  // A portal that left CKAN answers every CKAN request the same way — catalog.data.gov
+  // returns a bare 404 — so no status-based hint can be right for it. Say what happened
+  // and where the data went, whatever the status.
+  const migration = serverUrl ? getPortalMigration(serverUrl) : null;
+  if (migration) {
+    return `${message}\n→ ${migration.notice} See ${migration.docs_url}`;
+  }
+
+  let hint = '';
+  if (status === 404) {
+    if (action === 'datastore_search_sql') {
+      // SQL access is optional in CKAN and many portals disable it, answering 404 on
+      // the endpoint itself. The resource_id is usually fine — a bad table name comes
+      // back as a 400 instead — so pointing at `ckan_package_show` sends the caller
+      // round a loop that ends on the same 404.
+      hint = '→ This portal does not expose the SQL endpoint (optional in CKAN, often disabled). Use `ckan_datastore_search` with `filters`/`sort` instead; the resource_id is probably fine.';
+    } else if (action.startsWith('datastore_search')) {
+      hint = '→ Get a valid resource_id first: call `ckan_package_show` on a dataset, then pick a resource where `datastore_active` is true.';
+    } else if (action === 'package_show') {
+      hint = '→ Use `ckan_package_search` to find a valid dataset name or ID.';
+    } else if (action === 'organization_show') {
+      hint = '→ Use `ckan_organization_list` or `ckan_organization_search` to discover valid organization names.';
+    }
+  } else if (status === 400) {
+    if (action === 'datastore_search_sql') {
+      hint = '→ Invalid SQL syntax or unknown column — check column names with `ckan_datastore_search` before writing SQL.';
+    } else if (action.startsWith('datastore_search')) {
+      hint = '→ Bad request — likely an invalid field name or filter syntax; check column names with a `SELECT *` query first.';
+    }
+  } else if (status === 409 || status === 422) {
+    hint = '→ Portal rejected the request — parameters may conflict; simplify filters and retry.';
+  } else if (status === 503 || status === 502 || status === 504) {
+    hint = '→ Portal temporarily unavailable — retry in a few seconds.';
+  } else if (status === 500) {
+    hint = '→ Portal internal error — try a different portal or retry later.';
+  } else if (status === undefined) {
+    hint = '→ The portal may not support this action, or the endpoint is unavailable.';
+  }
+  return hint ? `${message}\n${hint}` : message;
+}
+
 let _lastCacheHit: boolean | null = null;
 
 /** Returns whether the last makeCkanRequest call was served from cache. */
@@ -27,10 +88,18 @@ export function getLastCacheHit(): boolean | null {
   return _lastCacheHit;
 }
 
+// Response/decompression size caps (DoS prevention — GHSA-q5gv). Generous enough for
+// any legitimate CKAN JSON, small enough to stop a decompression bomb from OOM-ing us.
+const MAX_RESPONSE_BYTES =
+  (typeof process !== "undefined" && Number(process.env?.CKAN_MAX_RESPONSE_BYTES)) || 32 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES =
+  (typeof process !== "undefined" && Number(process.env?.CKAN_MAX_DECOMPRESSED_BYTES)) || 64 * 1024 * 1024;
+
+type ZlibOptions = { maxOutputLength?: number };
 type ZlibModule = {
-  brotliDecompressSync: (input: Buffer) => Buffer;
-  gunzipSync: (input: Buffer) => Buffer;
-  inflateSync: (input: Buffer) => Buffer;
+  brotliDecompressSync: (input: Buffer, options?: ZlibOptions) => Buffer;
+  gunzipSync: (input: Buffer, options?: ZlibOptions) => Buffer;
+  inflateSync: (input: Buffer, options?: ZlibOptions) => Buffer;
 };
 
 const loadZlib = (() => {
@@ -114,6 +183,9 @@ async function decodeArrayBufferText(
       const decompressed = await new Response(
         new Blob([buffer]).stream().pipeThrough(stream)
       ).arrayBuffer();
+      if (decompressed.byteLength > MAX_DECOMPRESSED_BYTES) {
+        throw new Error("Decompressed response exceeds size limit");
+      }
       return new TextDecoder("utf-8").decode(decompressed).trim();
     } catch {
       // Fall back to plain text decoding.
@@ -164,23 +236,26 @@ async function decodePossiblyCompressed(
   let decodedBuffer = buffer;
   const zlib = await loadZlib();
 
+  const zlibOpts: ZlibOptions = { maxOutputLength: MAX_DECOMPRESSED_BYTES };
   try {
     if (zlib) {
       if (encoding?.includes("gzip")) {
-        decodedBuffer = zlib.gunzipSync(buffer);
+        decodedBuffer = zlib.gunzipSync(buffer, zlibOpts);
       } else if (encoding?.includes("br")) {
-        decodedBuffer = zlib.brotliDecompressSync(buffer);
+        decodedBuffer = zlib.brotliDecompressSync(buffer, zlibOpts);
       } else if (encoding?.includes("deflate")) {
-        decodedBuffer = zlib.inflateSync(buffer);
+        decodedBuffer = zlib.inflateSync(buffer, zlibOpts);
       } else if (
         buffer.length >= 2 &&
         buffer[0] === 0x1f &&
         buffer[1] === 0x8b
       ) {
-        decodedBuffer = zlib.gunzipSync(buffer);
+        decodedBuffer = zlib.gunzipSync(buffer, zlibOpts);
       }
     }
   } catch {
+    // Decompression failed or exceeded maxOutputLength: fall back to the raw buffer
+    // (kept bounded below by MAX_RESPONSE_BYTES on the request paths).
     decodedBuffer = buffer;
   }
 
@@ -196,8 +271,112 @@ async function decodePossiblyCompressed(
 }
 
 /**
+ * Returns true if an IP address (IPv4 or IPv6 string) is in a private/internal/special range.
+ * Shared by the synchronous literal guard (`validateServerUrl`) and the DNS-resolution
+ * guard (`createSsrfSafeLookup` / `assertHostnameResolvesSafe`), so a hostname that
+ * *resolves* to an internal address is blocked, not just an internal IP literal.
+ */
+/**
+ * Parse an IPv6 literal into its eight 16-bit words, or null if malformed.
+ * Total (never throws) and dependency-free: `isBlockedIp` also runs on the Workers
+ * build, where `node:net` is unavailable. Accepts every spelling of the same address
+ * (compressed, expanded, upper-case, leading zeros, trailing dotted-quad) so the
+ * classifier below decides on values, not on how the address happened to be written.
+ */
+function parseIpv6(input: string): number[] | null {
+  const v = input.split('%')[0]; // drop any zone id (fe80::1%eth0)
+  if (v.includes(':::') || (v.match(/::/g) || []).length > 1) return null;
+
+  const [head, tail, ...rest] = v.split('::');
+  if (rest.length > 0) return null;
+  const compressed = v.includes('::');
+
+  const words: number[] = [];
+  const pushGroups = (part: string): boolean => {
+    if (part === '') return true;
+    for (const g of part.split(':')) {
+      if (g.includes('.')) {
+        // trailing dotted-quad (::ffff:127.0.0.1, ::127.0.0.1)
+        const m = g.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+        if (!m) return false;
+        const o = m.slice(1).map(Number);
+        if (o.some((n) => n > 255)) return false;
+        words.push((o[0] << 8) | o[1], (o[2] << 8) | o[3]);
+        continue;
+      }
+      if (!/^[0-9a-f]{1,4}$/.test(g)) return false;
+      words.push(parseInt(g, 16));
+    }
+    return true;
+  };
+
+  if (!pushGroups(head)) return null;
+  const headLen = words.length;
+  if (!pushGroups(compressed ? tail : '')) return null;
+  const tailLen = words.length - headLen;
+
+  if (!compressed) return words.length === 8 ? words : null;
+  const gap = 8 - headLen - tailLen;
+  if (gap < 1) return null;
+  return [...words.slice(0, headLen), ...Array(gap).fill(0), ...words.slice(headLen)];
+}
+
+/**
+ * Returns true if an IP address (IPv4 or IPv6 string) is in a private/internal/special range.
+ * Shared by the synchronous literal guard (`validateServerUrl`) and the DNS-resolution
+ * guard (`createSsrfSafeLookup` / `assertHostnameResolvesSafe`), so a hostname that
+ * *resolves* to an internal address is blocked, not just an internal IP literal.
+ *
+ * IPv6 is parsed into words before classification: several IPv6 ranges embed an IPv4
+ * address (NAT64, 6to4, IPv4-compatible), so `64:ff9b::a9fe:a9fe` is the cloud metadata
+ * endpoint written in IPv6 and must be blocked exactly like 169.254.169.254.
+ */
+export function isBlockedIp(ip: string): boolean {
+  const v = ip.toLowerCase().trim();
+
+  // IPv6 (any address containing a colon)
+  if (v.includes(':')) {
+    const w = parseIpv6(v);
+    if (!w) return true; // unparseable: fail closed
+    const zeros = (n: number) => w.slice(0, n).every((x) => x === 0);
+    return (
+      zeros(6) ||                                  // ::/96 unspecified, loopback, IPv4-compatible
+      (zeros(5) && w[5] === 0xffff) ||             // ::ffff:0:0/96 IPv4-mapped
+      (w[0] === 0x0064 && w[1] === 0xff9b &&
+        ((w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0) ||
+          w[2] === 0x0001)) ||                     // 64:ff9b::/96 + 64:ff9b:1::/48 NAT64
+      w[0] === 0x2002 ||                           // 2002::/16 6to4
+      (w[0] === 0x2001 && w[1] === 0x0000) ||      // 2001::/32 Teredo
+      (w[0] & 0xfe00) === 0xfc00 ||                // fc00::/7 unique local
+      (w[0] & 0xffc0) === 0xfe80 ||                // fe80::/10 link-local
+      (w[0] & 0xffc0) === 0xfec0 ||                // fec0::/10 site-local (deprecated)
+      (w[0] & 0xff00) === 0xff00                   // ff00::/8 multicast
+    );
+  }
+
+  // IPv4 dotted-decimal
+  const m = v.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (!m) return false;
+  const o1 = Number(m[1]);
+  const o2 = Number(m[2]);
+  return (
+    o1 === 0 ||                              // 0.0.0.0/8
+    o1 === 10 ||                             // 10.0.0.0/8 private
+    o1 === 127 ||                            // 127.0.0.0/8 loopback
+    (o1 === 100 && o2 >= 64 && o2 <= 127) || // 100.64.0.0/10 shared
+    (o1 === 169 && o2 === 254) ||            // 169.254.0.0/16 link-local / cloud metadata
+    (o1 === 172 && o2 >= 16 && o2 <= 31) ||  // 172.16.0.0/12 private
+    (o1 === 192 && o2 === 168) ||            // 192.168.0.0/16 private
+    (o1 === 198 && (o2 === 18 || o2 === 19)) || // 198.18.0.0/15 benchmarking
+    o1 >= 224                                // 224.0.0.0/4 multicast, 240.0.0.0/4 reserved, broadcast
+  );
+}
+
+/**
  * Validate that a server URL is safe to request (SSRF prevention).
- * Blocks non-HTTP/S protocols and private/internal IP ranges.
+ * Blocks non-HTTP/S protocols and private/internal IP *literals*.
+ * Hostnames that resolve to internal IPs are blocked later, at connection time,
+ * by the DNS-resolution guards (see `createSsrfSafeLookup` / `assertHostnameResolvesSafe`).
  */
 export function validateServerUrl(serverUrl: string): void {
   let parsed: URL;
@@ -213,42 +392,25 @@ export function validateServerUrl(serverUrl: string): void {
 
   const hostname = parsed.hostname.toLowerCase();
 
-  if (hostname === 'localhost') {
+  const BLOCKED_HOSTNAMES = new Set([
+    'localhost',
+    'ip6-localhost',
+    'ip6-loopback',
+  ]);
+  if (BLOCKED_HOSTNAMES.has(hostname)) {
     throw new Error(`Access to "${hostname}" is not allowed.`);
   }
 
-  // Block IPv4 private/special ranges
-  const ipv4 = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  if (ipv4) {
-    const [o1, o2] = ipv4.slice(1).map(Number);
-    const blocked =
-      o1 === 0 ||                              // 0.0.0.0/8
-      o1 === 10 ||                             // 10.0.0.0/8 private
-      o1 === 127 ||                            // 127.0.0.0/8 loopback
-      (o1 === 100 && o2 >= 64 && o2 <= 127) || // 100.64.0.0/10 shared
-      (o1 === 169 && o2 === 254) ||            // 169.254.0.0/16 link-local / AWS metadata
-      (o1 === 172 && o2 >= 16 && o2 <= 31) ||  // 172.16.0.0/12 private
-      (o1 === 192 && o2 === 168) ||            // 192.168.0.0/16 private
-      o1 === 255;                              // broadcast
-    if (blocked) {
-      throw new Error(`Access to private/internal IP addresses is not allowed.`);
-    }
+  // Block IPv4 private/special literals. WHATWG URL already normalizes integer/hex/
+  // octal/short IPv4 forms (e.g. 0x7f000001 → 127.0.0.1) to dotted-decimal here, so a
+  // single dotted-quad check covers all those encodings (GHSA-8hxx).
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) && isBlockedIp(hostname)) {
+    throw new Error(`Access to private/internal IP addresses is not allowed.`);
   }
 
-  // Block IPv6 private/loopback
-  if (hostname.startsWith('[')) {
-    const ipv6 = hostname.slice(1, -1);
-    const lower = ipv6.toLowerCase();
-    const blockedIpv6 =
-      lower === '::1' ||           // loopback
-      lower === '::' ||            // unspecified
-      lower.startsWith('fc') ||    // fc00::/7 unique local
-      lower.startsWith('fd') ||    // fd00::/8 unique local
-      lower.startsWith('fe80') ||  // fe80::/10 link-local
-      lower.startsWith('::ffff:'); // IPv4-mapped
-    if (blockedIpv6) {
-      throw new Error(`Access to private/internal IPv6 addresses is not allowed.`);
-    }
+  // Block IPv6 private/loopback literals (URL hostname keeps the brackets)
+  if (hostname.startsWith('[') && isBlockedIp(hostname.slice(1, -1))) {
+    throw new Error(`Access to private/internal IPv6 addresses is not allowed.`);
   }
 
   // CERT-AgID rec. #2 (allowlist restrittive) — note di architettura:
@@ -291,6 +453,235 @@ export function validateServerUrl(serverUrl: string): void {
         `Domain "${hostname}" is not in the allowed list (CKAN_ALLOWED_DOMAINS).`
       );
     }
+  }
+}
+
+/**
+ * Refuse to run the network-exposed HTTP transport without a domain allowlist.
+ * `CKAN_ALLOWED_DOMAINS` (default-deny) is mandatory for HTTP; set
+ * `CKAN_HTTP_ALLOW_ALL=true` to explicitly opt out (logs a warning).
+ * stdio is unaffected — it stays open so any portal can be queried locally.
+ */
+export function assertHttpAllowlistConfigured(): void {
+  const raw = typeof process !== 'undefined' ? (process.env.CKAN_ALLOWED_DOMAINS ?? '') : '';
+  const domains = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (domains.length > 0) return;
+
+  if (typeof process !== 'undefined' && process.env.CKAN_HTTP_ALLOW_ALL === 'true') {
+    console.error(
+      '[SECURITY WARNING] HTTP transport is running WITHOUT a domain allowlist ' +
+      '(CKAN_HTTP_ALLOW_ALL=true). Any client can drive requests to arbitrary hosts. ' +
+      'Set CKAN_ALLOWED_DOMAINS to restrict which CKAN hosts can be queried.'
+    );
+    return;
+  }
+
+  throw new Error(
+    'Refusing to start HTTP transport without a domain allowlist.\n' +
+    'Set CKAN_ALLOWED_DOMAINS="portal1.org,portal2.gov" to restrict which hosts can be queried,\n' +
+    'or set CKAN_HTTP_ALLOW_ALL=true to explicitly run without restriction (NOT recommended when network-exposed).'
+  );
+}
+
+type ResolvedAddress = { address: string; family?: number };
+type DnsLookupModule = {
+  lookup: (
+    hostname: string,
+    options: { all: true; family?: number },
+    callback: (err: NodeJS.ErrnoException | null, addresses: ResolvedAddress[]) => void
+  ) => void;
+};
+
+/**
+ * Build a Node `lookup` function (for http/https Agents) that resolves the hostname,
+ * rejects if ANY resolved address is private/internal, and pins the connection to the
+ * validated address — closing the DNS-name SSRF bypass and DNS-rebinding (the IP the
+ * socket connects to is exactly the one we validated, no second resolution).
+ * Exported with an injectable dns module so it can be unit-tested without real DNS.
+ */
+export function createSsrfSafeLookup(dnsModule: DnsLookupModule) {
+  return function ssrfSafeLookup(hostname: string, options: any, callback: any): void {
+    if (typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+    const family = options && typeof options === 'object' ? options.family : undefined;
+    dnsModule.lookup(hostname, { all: true, family: family || 0 }, (err, addresses) => {
+      if (err) {
+        callback(err);
+        return;
+      }
+      const list = Array.isArray(addresses) ? addresses : [addresses as ResolvedAddress];
+      for (const a of list) {
+        if (isBlockedIp(a.address)) {
+          callback(new Error(
+            `Access to private/internal IP addresses is not allowed ` +
+            `("${hostname}" resolves to ${a.address}).`
+          ));
+          return;
+        }
+      }
+      if (options && options.all) {
+        callback(null, list);
+        return;
+      }
+      callback(null, list[0].address, list[0].family);
+    });
+  };
+}
+
+let _safeAgents: Promise<{ httpAgent: unknown; httpsAgent: unknown } | null> | null = null;
+
+/** Lazily build SSRF-safe http/https Agents (Node only). Returns null off Node/on failure. */
+function getSafeAgents(): Promise<{ httpAgent: unknown; httpsAgent: unknown } | null> {
+  if (!_safeAgents) {
+    _safeAgents = (async () => {
+      try {
+        // String-concatenated specifiers keep esbuild from bundling node builtins
+        // into the Cloudflare Workers build (mirrors loadZlib above).
+        const dnsMod = (await import("node:" + "dns")) as unknown as DnsLookupModule;
+        const httpMod = (await import("node:" + "http")) as any;
+        const httpsMod = (await import("node:" + "https")) as any;
+        const lookup = createSsrfSafeLookup(dnsMod);
+        return {
+          httpAgent: new httpMod.Agent({ lookup }),
+          httpsAgent: new httpsMod.Agent({ lookup }),
+        };
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return _safeAgents;
+}
+
+type SsrfSafeLookup = ReturnType<typeof createSsrfSafeLookup>;
+type UndiciModule = {
+  Agent: new (options: { connect: { lookup: SsrfSafeLookup } }) => unknown;
+};
+
+let _safeDispatcher: Promise<unknown | null> | null = null;
+
+/**
+ * Lazily build an undici Dispatcher whose connections resolve through
+ * `createSsrfSafeLookup`, so `fetch()` connects to exactly the address we validated.
+ * This is what `httpAgent`/`httpsAgent` do for the axios path: without it the fetch
+ * path validates the hostname and then lets undici resolve it a second time, leaving
+ * a TOCTOU window a DNS-rebinding record can win.
+ * Returns null off Node (Cloudflare Workers, where the CF sandbox blocks internal egress).
+ */
+export function getSafeDispatcher(): Promise<unknown | null> {
+  if (!_safeDispatcher) {
+    _safeDispatcher = (async () => {
+      try {
+        // Non-constant specifiers: esbuild constant-folds `"undici" + ""` and would
+        // bundle the whole of undici (and break the browser-platform Workers build),
+        // so the name is assembled at runtime and left as a live dynamic import.
+        const dnsMod = (await import("node:" + "dns")) as unknown as DnsLookupModule;
+        const undiciSpecifier = ["und", "ici"].join("");
+        const undiciMod = (await import(undiciSpecifier)) as UndiciModule;
+        return new undiciMod.Agent({ connect: { lookup: createSsrfSafeLookup(dnsMod) } });
+      } catch {
+        return null;
+      }
+    })();
+  }
+  return _safeDispatcher;
+}
+
+type DnsResolver = (hostname: string) => Promise<ResolvedAddress[]>;
+let _dnsResolver: DnsResolver | null = null;
+
+/** Test seam: override the DNS resolver used by `assertHostnameResolvesSafe`. */
+export function __setDnsResolverForTests(fn: DnsResolver | null): void {
+  _dnsResolver = fn;
+}
+
+/**
+ * Resolve a hostname and throw if it maps to a private/internal IP.
+ * Used by the fetch-based paths (e.g. sparql_query) that cannot attach a custom
+ * lookup agent. No-op when DNS is unavailable (Cloudflare Workers — CF sandbox
+ * already blocks internal addresses) or when resolution fails (request fails naturally).
+ */
+export async function assertHostnameResolvesSafe(hostname: string): Promise<void> {
+  let lookup: DnsResolver;
+  if (_dnsResolver) {
+    lookup = _dnsResolver;
+  } else {
+    let dnsMod: any;
+    try {
+      dnsMod = await import("node:" + "dns");
+    } catch {
+      // DNS module unavailable (Cloudflare Workers): the CF sandbox already blocks
+      // internal egress, so this guard is a no-op there.
+      return;
+    }
+    lookup = (h: string) => dnsMod.promises.lookup(h, { all: true });
+  }
+
+  let addresses: ResolvedAddress[];
+  try {
+    addresses = await lookup(hostname);
+  } catch {
+    // Fail closed: if we cannot resolve the name, do NOT let the request proceed to a
+    // socket that would resolve it independently (TOCTOU / SSRF bypass).
+    throw new Error(`Cannot resolve "${hostname}" for SSRF validation (failing closed).`);
+  }
+
+  for (const a of addresses) {
+    if (isBlockedIp(a.address)) {
+      throw new Error(
+        `Access to private/internal IP addresses is not allowed ` +
+        `("${hostname}" resolves to ${a.address}).`
+      );
+    }
+  }
+}
+
+/**
+ * Fetch that does NOT blindly follow redirects: each hop's target is re-validated
+ * with `validateServerUrl` + `assertHostnameResolvesSafe` before it is followed,
+ * closing redirect-based SSRF (e.g. a public endpoint 302-ing to 169.254.169.254).
+ * The caller is expected to have validated the initial URL already.
+ *
+ * On Node every hop also goes through the SSRF-safe undici dispatcher, which pins the
+ * connection to the address it validated — so a rebinding record cannot swap in an
+ * internal IP between the check and the connect. `assertHostnameResolvesSafe` stays as
+ * defence in depth for runtimes where no dispatcher is available.
+ * On Workers, `assertHostnameResolvesSafe` is a no-op (the CF sandbox blocks internal egress).
+ */
+export async function safeFetch(
+  url: string,
+  init: RequestInit = {},
+  opts: { maxHops?: number; httpsOnly?: boolean } = {}
+): Promise<Response> {
+  const maxHops = opts.maxHops ?? 3;
+  const dispatcher = await getSafeDispatcher();
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    const response = await fetch(current, {
+      ...init,
+      redirect: "manual",
+      ...(dispatcher ? { dispatcher } : {})
+    } as RequestInit);
+    const status = response.status;
+    const location = response.headers.get("location");
+    const isRedirect =
+      (status === 301 || status === 302 || status === 303 ||
+       status === 307 || status === 308) && !!location;
+    if (!isRedirect) {
+      return response;
+    }
+    if (hop >= maxHops) {
+      throw new Error(`Too many redirects (>${maxHops})`);
+    }
+    const next = new URL(location as string, current).toString();
+    if (opts.httpsOnly && new URL(next).protocol !== "https:") {
+      throw new Error("Redirect to a non-HTTPS URL is not allowed");
+    }
+    validateServerUrl(next);
+    await assertHostnameResolvesSafe(new URL(next).hostname);
+    current = next;
   }
 }
 
@@ -380,10 +771,20 @@ export async function makeCkanRequest<T>(
     let decodedData: unknown;
 
     if (isNode) {
+      const safeAgents = await getSafeAgents();
       const response = await axios.get(url, {
         params,
         timeout: 30000,
         responseType: "arraybuffer",
+        maxRedirects: 5,
+        // Never route through HTTP_PROXY/HTTPS_PROXY: a proxy would connect to the
+        // target itself, bypassing the SSRF-safe lookup pinned in the agents below.
+        proxy: false,
+        maxContentLength: MAX_RESPONSE_BYTES,
+        maxBodyLength: MAX_RESPONSE_BYTES,
+        ...(safeAgents
+          ? { httpAgent: safeAgents.httpAgent, httpsAgent: safeAgents.httpsAgent }
+          : {}),
         headers: {
           Accept: 'application/json, text/plain, */*',
           'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
@@ -431,10 +832,17 @@ export async function makeCkanRequest<T>(
       }
 
       if (!response.ok) {
-        throw new Error(`CKAN API error (${response.status}): ${response.statusText}`);
+        throw new CkanApiError(`CKAN API error (${response.status}): ${response.statusText}`, response.status, action, serverUrl);
       }
 
+      const declaredLength = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+        throw new CkanApiError(`Response too large (${declaredLength} bytes)`, undefined, action, serverUrl);
+      }
       const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > MAX_RESPONSE_BYTES) {
+        throw new CkanApiError(`Response too large (${buffer.byteLength} bytes)`, undefined, action, serverUrl);
+      }
       const headers: Record<string, string> = {};
       response.headers.forEach((headerValue, headerKey) => {
         headers[headerKey] = headerValue;
@@ -457,18 +865,33 @@ export async function makeCkanRequest<T>(
       auditLog(serverUrl, action, params, false);
       return result;
     } else {
-      throw new Error(
-        `CKAN API returned success=false: ${JSON.stringify(decodedData)}`
+      // Do NOT reflect the full upstream body to the caller: if the server was
+      // pointed/redirected at a non-CKAN host it could carry internal detail,
+      // turning blind SSRF into a return-value channel (GHSA-6f9w). Log it
+      // server-side only (truncated) and return a generic, action-scoped error.
+      try {
+        if (typeof process !== "undefined") {
+          process.stderr.write(
+            `[ckan] success=false action=${action}: ${JSON.stringify(decodedData).slice(0, 500)}\n`
+          );
+        }
+      } catch { /* ignore logging failures */ }
+      throw new CkanApiError(
+        `CKAN API returned success=false for action "${action}".`,
+        undefined,
+        action,
+        serverUrl
       );
     }
   } catch (error) {
+    if (error instanceof CkanApiError) throw error;
     if (axios.isAxiosError(error)) {
       const axiosError = error as AxiosError;
       if (axiosError.response) {
         const status = axiosError.response.status;
         const data = axiosError.response.data as any;
         const errorMsg = data?.error?.message || data?.error || 'Unknown error';
-        throw new Error(`CKAN API error (${status}): ${errorMsg}`);
+        throw new CkanApiError(`CKAN API error (${status}): ${errorMsg}`, status, action, serverUrl);
       } else if (axiosError.code === 'ECONNABORTED') {
         throw new Error(`Request timeout connecting to ${serverUrl}`);
       } else if (axiosError.code === 'ENOTFOUND') {
