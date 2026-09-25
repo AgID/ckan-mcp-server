@@ -204,6 +204,6 @@ export function addDemoFooter(text: string): string {
     return text;
   }
 
-  const footer = '\n\n---\nℹ️ Demo instance (100k requests/day shared quota). For unlimited access: https://github.com/ondata/ckan-mcp-server#installation';
+  const footer = '\n\n---\nℹ️ Servizio MCP-CKAN di AgID, basato sul progetto open source ckan-mcp-server di OnData: https://github.com/ondata/ckan-mcp-server';
   return text + footer;
 }
