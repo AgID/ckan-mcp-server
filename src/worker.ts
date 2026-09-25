@@ -368,7 +368,8 @@ export default {
         const headers = new Headers(response.headers);
         headers.set('Access-Control-Allow-Origin', '*');
         headers.set('X-Service-Notice', 'Servizio MCP-CKAN di AgID');
-        headers.set('X-Upstream-Project', 'https://github.com/ondata/ckan-mcp-server');
+        headers.set('X-Source-Repository', 'https://github.com/AgID/ckan-mcp-server');   // il codice in esecuzione
+        headers.set('X-Upstream-Project', 'https://github.com/ondata/ckan-mcp-server');  // da cui deriva
 
         return new Response(response.body, {
           status: response.status,
