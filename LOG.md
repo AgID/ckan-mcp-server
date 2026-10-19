@@ -2,6 +2,10 @@
 
 ## 2026-10-19
 
+### Advisory GHSA-w3gp-3hrh-v465 published
+
+Reported by @olevasseur, accepted and published as Medium (CVSS 6.5): affected `>= 0.4.114, <= 0.4.129`, patched `0.4.130`. CVE requested, not yet assigned. v0.4.130 is live on npm (with provenance), the MCP Registry and the Worker. `SECURITY.md` table updated.
+
 ### v0.4.130
 
 Ships #561: linear shrink in `truncateJson` (GHSA-w3gp-3hrh-v465). Tests 589 passed, smoke 17/17.

@@ -24,6 +24,7 @@ with the fix released to npm before publication.
 
 | Published | Advisory | CVE | Severity | Fixed in | Issue |
 |---|---|---|---|---|---|
+| 2026-10-19 | [GHSA-w3gp-3hrh-v465](https://github.com/ondata/ckan-mcp-server/security/advisories/GHSA-w3gp-3hrh-v465) | requested | Medium | 0.4.130 | Quadratic shrink loop in `truncateJson` blocks the event loop (DoS via oversized portal response) |
 | 2026-09-28 | [GHSA-279h-fmcr-4rwv](https://github.com/ondata/ckan-mcp-server/security/advisories/GHSA-279h-fmcr-4rwv) | requested | Medium | 0.4.128 | SSRF via redirect to an IP literal in `makeCkanRequest` (agent `lookup` skipped for IP literals) |
 | 2026-08-20 | [GHSA-x32r-mh7g-q2rf](https://github.com/ondata/ckan-mcp-server/security/advisories/GHSA-x32r-mh7g-q2rf) | CVE-2026-92146 | Medium | 0.4.119 | SSRF guard missed IPv6 ranges embedding IPv4 (NAT64 / 6to4 / IPv4-compatible) |
 | 2026-07-09 | [GHSA-vmrr-v4xp-42cx](https://github.com/ondata/ckan-mcp-server/security/advisories/GHSA-vmrr-v4xp-42cx) | CVE-2026-76812 | Critical | 0.4.110 | Unauthenticated remote SSRF to cloud metadata → IAM credential theft |
