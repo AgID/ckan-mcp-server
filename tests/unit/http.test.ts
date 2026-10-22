@@ -3,8 +3,9 @@ import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import type { AddressInfo } from 'node:net';
 import axios from 'axios';
 import type { AxiosRequestConfig } from 'axios';
-import { makeCkanRequest, validateServerUrl, CkanApiError, CkanTransportError, SsrfGuardError, formatCkanError, isBlockedIp, createSsrfSafeLookup, assertHttpAllowlistConfigured, assertHostnameResolvesSafe, getSafeDispatcher, __setDnsResolverForTests } from '../../src/utils/http';
+import { makeCkanRequest, validateServerUrl, CkanApiError, CkanTransportError, SsrfGuardError, formatCkanError, isBlockedIp, createSsrfSafeLookup, assertHttpAllowlistConfigured, assertHostnameResolvesSafe, getSafeDispatcher, __setDnsResolverForTests, isAnubisChallenge } from '../../src/utils/http';
 import { __resetCacheForTests } from '../../src/utils/cache';
+import { getRateLimiter, __resetRateLimiterForTests } from '../../src/utils/rate-limiter';
 import successResponse from '../fixtures/responses/status-success.json';
 
 vi.mock('axios');
@@ -563,6 +564,95 @@ describe('makeCkanRequest', () => {
     expect(axiosCall[1].headers['User-Agent']).toBe(
       'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
+  });
+
+  describe('Anubis challenge retry (issue #7)', () => {
+    const challengePage =
+      '<!doctype html><html><head><title>Making sure you&#39;re not a bot!</title></head>' +
+      '<body><script id="anubis_challenge" type="application/json">{}</script></body></html>';
+
+    it('detects the challenge page, not ordinary HTML or JSON', () => {
+      expect(isAnubisChallenge(challengePage)).toBe(true);
+      expect(isAnubisChallenge('<html><body>Request Rejected</body></html>')).toBe(false);
+      expect(isAnubisChallenge(successResponse)).toBe(false);
+    });
+
+    it('retries once with the honest UA and no Sec-CH-UA headers', async () => {
+      vi.mocked(axios.get)
+        .mockResolvedValueOnce({ data: challengePage })
+        .mockResolvedValueOnce({ data: successResponse });
+
+      const result = await makeCkanRequest(
+        'https://www.dati.gov.it/opendata', 'status_show', {}, { cache: false, rateLimit: false }
+      );
+
+      expect(result).toEqual(successResponse.result);
+      expect(axios.get).toHaveBeenCalledTimes(2);
+      const first = vi.mocked(axios.get).mock.calls[0][1]!.headers as Record<string, string>;
+      const retry = vi.mocked(axios.get).mock.calls[1][1]!.headers as Record<string, string>;
+      expect(first['User-Agent']).toContain('Chrome/120');
+      expect(retry['User-Agent']).toBe('CKAN-MCP-Server/1.0');
+      expect(retry).not.toHaveProperty('Sec-CH-UA');
+      expect(retry).not.toHaveProperty('Sec-CH-UA-Mobile');
+      expect(retry).not.toHaveProperty('Sec-CH-UA-Platform');
+    });
+
+    it('does not retry when there is no challenge', async () => {
+      vi.mocked(axios.get).mockResolvedValue({ data: successResponse });
+
+      await makeCkanRequest('https://www.dati.gov.it/opendata', 'status_show', {}, { cache: false, rateLimit: false });
+
+      expect(axios.get).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries only once: a second challenge fails as success=false', async () => {
+      vi.mocked(axios.get).mockResolvedValue({ data: challengePage });
+
+      await expect(
+        makeCkanRequest('https://www.dati.gov.it/opendata', 'status_show', {}, { cache: false, rateLimit: false })
+      ).rejects.toThrow('CKAN API returned success=false');
+      expect(axios.get).toHaveBeenCalledTimes(2);
+    });
+
+    it('Workers (fetch) path retries with the honest UA too', async () => {
+      const origAllowed = process.env.CKAN_ALLOWED_DOMAINS;
+      delete process.env.CKAN_ALLOWED_DOMAINS;
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response(challengePage, { status: 200, headers: { 'Content-Type': 'text/html' } }))
+        .mockResolvedValueOnce(new Response(JSON.stringify(successResponse), { status: 200 }));
+      vi.stubGlobal('fetch', fetchMock);
+      vi.stubGlobal('process', { ...process, env: process.env, versions: {} });
+      try {
+        const result = await makeCkanRequest(
+          'https://www.dati.gov.it/opendata', 'status_show', {}, { cache: false, rateLimit: false }
+        );
+        expect(result).toEqual(successResponse.result);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        const retryHeaders = new Headers(fetchMock.mock.calls[1][1].headers);
+        expect(retryHeaders.get('User-Agent')).toBe('CKAN-MCP-Server/1.0');
+      } finally {
+        vi.unstubAllGlobals();
+        if (origAllowed === undefined) delete process.env.CKAN_ALLOWED_DOMAINS; else process.env.CKAN_ALLOWED_DOMAINS = origAllowed;
+      }
+    });
+
+    it('the retry acquires its own rate-limit token', async () => {
+      vi.stubEnv('CKAN_RATE_LIMIT_ENABLED', 'true');
+      __resetRateLimiterForTests();
+      const acquire = vi.spyOn(getRateLimiter(), 'acquire').mockResolvedValue(undefined);
+      vi.mocked(axios.get)
+        .mockResolvedValueOnce({ data: challengePage })
+        .mockResolvedValueOnce({ data: successResponse });
+      try {
+        await makeCkanRequest('https://www.dati.gov.it/opendata', 'status_show', {}, { cache: false });
+        expect(acquire).toHaveBeenCalledTimes(2);
+        expect(acquire).toHaveBeenNthCalledWith(2, 'www.dati.gov.it');
+      } finally {
+        acquire.mockRestore();
+        vi.unstubAllEnvs();
+        __resetRateLimiterForTests();
+      }
+    });
   });
 
   it("disables environment proxies so the SSRF-safe lookup pins the real target", async () => {
