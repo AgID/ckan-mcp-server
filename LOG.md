@@ -4,7 +4,7 @@
 
 ### v0.4.131
 
-Ships #563: Anubis challenge retry with an honest User-Agent (#7). Tests 595 passed, smoke 17/17.
+Ships #563: Anubis challenge retry with an honest User-Agent (#7). Tests 595 passed, smoke 17/17. Live on npm (with provenance; the registry took ~5 min to serve it after the CI publish), the MCP Registry (`isLatest`), the Worker (`/health` 0.4.131) and the GitHub release (DXT + skill attached).
 
 ### Anubis-fronted portals: retry once with an honest User-Agent (#7)
 
