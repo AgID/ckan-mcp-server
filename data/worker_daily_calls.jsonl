@@ -221,4 +221,9 @@
 {"date":"2026-10-18","calls":81,"ok":70,"errors":11}
 {"date":"2026-10-19","calls":21,"ok":20,"errors":1}
 {"date":"2026-10-20","calls":51,"ok":36,"errors":15}
-{"date":"2026-10-21","calls":11,"ok":3,"errors":8}
+{"date":"2026-10-21","calls":28,"ok":8,"errors":20}
+{"date":"2026-10-22","calls":50,"ok":29,"errors":21}
+{"date":"2026-10-23","calls":833,"ok":790,"errors":43}
+{"date":"2026-10-24","calls":43,"ok":23,"errors":20}
+{"date":"2026-10-25","calls":18,"ok":4,"errors":14}
+{"date":"2026-10-26","calls":600,"ok":592,"errors":8}
