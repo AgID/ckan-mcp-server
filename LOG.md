@@ -1,5 +1,11 @@
 # LOG
 
+## 2026-10-26
+
+### Update Worker Telemetry: DuckDB pinned to v2.0.0
+
+The workflow had failed twice a day since 2026-10-21: DuckDB v2.0.0 (released that day) renamed the CLI asset from `duckdb_cli-linux-amd64.zip` to `duckdb-cli-linux-amd64.tar.gz`, so `releases/latest/download/...zip` returned 404. Now downloads the v2.0.0 tarball explicitly (pinned, so a future rename does not break it again). Checked locally: `scripts/worker_daily_stats.sh` with v2.0.0 and v1.5.6 in UTC gives output identical to the committed `data/worker_daily_calls.jsonl`. Note: v2.0.0 reads `...Z` timestamps as `TIMESTAMPTZ`, so `::TIMESTAMP` follows the machine time zone; on the UTC runner nothing changes, on a non-UTC machine the daily counts shift.
+
 ## 2026-10-22
 
 ### v0.4.131
