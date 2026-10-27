@@ -4,7 +4,7 @@
 
 ### v0.4.133
 
-Ships #568. For callers: `ckan_find_portals` works again on the hosted Worker (it failed on every call since at least 2026-09-05); `ckan_status_show` on a site that is not a CKAN API now says so and points at `ckan_find_portals`, instead of telling the caller to call `ckan_status_show`; `open.toronto.ca` works as a server URL in every tool (routed to its CKAN host). Tests 616 passed. Smoke 16/17: same MQA outage as v0.4.132 (per-dataset `/api/mqa/cache/*/{id}` still not answering, `/global` 0.2 s), tagged with `SKIP_RELEASE_GATE=1` on the user's decision.
+Ships #568. For callers: `ckan_find_portals` works again on the hosted Worker (it failed on every call since at least 2026-09-05); `ckan_status_show` on a site that is not a CKAN API now says so and points at `ckan_find_portals`, instead of telling the caller to call `ckan_status_show`; `open.toronto.ca` works as a server URL in every tool (routed to its CKAN host). Tests 616 passed. Smoke 16/17: same MQA outage as v0.4.132 (per-dataset `/api/mqa/cache/*/{id}` still not answering, `/global` 0.2 s), tagged with `SKIP_RELEASE_GATE=1` on the user's decision. Live on npm (provenance), the MCP Registry (`isLatest`), the Worker (`/health` 0.4.133) and the GitHub release (DXT + skill). Checked on the live Worker: `ckan_find_portals` 945 portals in 4.4 s, 749 ms CPU; `open.toronto.ca` search routed (17 results). MQA outage confirmed from the browser: data.europa.eu's own quality page calls the same `/api/mqa/cache/datasets/{id}` and gets no answer either.
 
 ### Telemetry errors: find_portals fixed on Workers, error messages logged, non-CKAN hints
 
