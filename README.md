@@ -5,6 +5,55 @@
 [![Newsletter](https://img.shields.io/badge/newsletter-ondata-FF6719?logo=substack)](https://ondata.substack.com/)
 [![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
 
+# CKAN MCP Server AgID
+*repo fork del progetto di **[OnData](https://github.com/ondata/ckan-mcp-server)** a servizio del Connettore MCP-CKAN su CloudFlare*
+
+**Link per l'endpoint MCP-CKAN per i vari Chatbot AI --> [EndPoint AgID](https://ckan-mcp-server.agid.workers.dev/mcp)**
+
+**Un ringraziamento particolare all'associazione OnData per aver sviluppato questo strumento open-source di grande utilità.**
+**Consigliamo anche l'MCP ISTAT sempre sviluppato da OnData che potete trovare qui -->[Repo MCP ISTAT](https://github.com/ondata/istat_mcp_server)**
+
+---
+
+## Conformità CERT-AgID — paper aprile 2026
+
+Questo Worker è valutato rispetto alle 4 raccomandazioni del paper CERT-AgID
+[*LLM e Model Context Protocol: un'analisi di sicurezza*](https://www.agid.gov.it/it/notizie/llm-e-model-context-protocol-unanalisi-di-sicurezza-del-cert-agid)
+con un'avvertenza architetturale: questo è un **MCP "broker"** che, per
+definizione, esplora cataloghi CKAN/SPARQL pubblici di centinaia di
+amministrazioni della PA italiana e dell'UE. Le raccomandazioni vanno
+quindi calibrate sul caso d'uso "discovery" e non "interno chiuso".
+
+| # | Raccomandazione | Stato | Implementazione |
+|---|---|---|---|
+| 1 | **Validazione vincolante** | ✅ | Schemi `zod` su tutti gli input dei tool; check bloccante locale `SELECT/WITH`-only sul tool `ckan_datastore_search_sql` (no fallback al CKAN remoto come unica difesa); blocco di SQL multi-statement, commenti `--`/`/* */`, e parole chiave di scrittura. |
+| 2 | **Allowlist restrittive** | ⚠️ N/A pieno | Una allowlist hard-coded distruggerebbe la funzione di discovery del broker. **Mitigazioni equivalenti**: (a) SSRF strict mode bloccante — RFC1918, loopback, link-local, AWS metadata, IPv6 ULA/loopback, (b) allowlist OPZIONALE via env `CKAN_ALLOWED_DOMAINS` con supporto wildcard (es. `*.gov.it,*.europa.eu`) per deploy chiusi, (c) denylist OPZIONALE via env `CKAN_BLOCKED_DOMAINS`. |
+| 3 | **Minimo privilegio** | ✅ | Ogni tool ha scope specifico (`ckan_status_show`, `ckan_package_search`, `ckan_datastore_search`, `sparql_query`, ecc.), annotazioni MCP `readOnlyHint: true`, `destructiveHint: false`. Nessuna funzione generica/abusabile. |
+| 4 | **Controllo e monitoraggio** | ✅ | Rate limiter token-bucket per-hostname (default 5 rps, env `CKAN_RATE_LIMIT_RPS` configurabile), audit log JSON di tutte le richieste (`tool`, `server`, `q`, `sql` troncato, `cache_hit`) emesso sia su stderr (Node) sia su `console.log` (CF Workers Logs). Bearer auth opzionale via env `CKAN_AUTH_TOKEN` per deploy autenticati. |
+
+### Variabili di configurazione (Cloudflare Worker → `wrangler.toml` `[vars]` o secrets)
+
+| Variabile | Default | Uso |
+|---|---|---|
+| `CKAN_ALLOWED_DOMAINS` | _vuoto_ (open) | Lista CSV di domini (anche wildcard `*.gov.it`). Se valorizzata, blocca tutte le request verso domini fuori lista. |
+| `CKAN_BLOCKED_DOMAINS` | _vuoto_ | Lista CSV di domini sempre bloccati (valutata prima dell'allowlist). |
+| `CKAN_AUTH_TOKEN` | _vuoto_ (open) | Se valorizzata, ogni `POST /mcp` deve includere `Authorization: Bearer <token>`. |
+| `CKAN_RATE_LIMIT_ENABLED` | `true` | Spegne il rate limiter token-bucket. |
+| `CKAN_RATE_LIMIT_RPS` | `5` | Richieste/secondo per hostname upstream. |
+| `CKAN_RATE_LIMIT_BURST` | `10` | Token burst del bucket. |
+
+### Note sul caso "MCP broker"
+
+Le rec. CERT-AgID #1, #3, #4 sono pienamente applicabili e applicate.
+La rec. #2 (allowlist) è scritta per MCP "interni" che chiamano un solo
+backend controllato. Per MCP "broker" come questo l'equivalente
+funzionale è SSRF stretto + audit log + rate limit (tutti implementati).
+Per audit istituzionali AgID che richiedano allowlist hard, è
+sufficiente settare `CKAN_ALLOWED_DOMAINS` con i pattern desiderati
+nella dashboard CF dell'account AgID, senza redeploy del codice.
+
+---
+
 # CKAN MCP Server
 
 *Turn any (CKAN) open data portal into a conversation.*
@@ -27,7 +76,7 @@ CKAN is the open-source platform behind most public open data portals worldwide 
 | **Best for** | Runs on your machine, works with any local tool | Quick start, zero setup |
 | **Request quota** | No shared quota | 100k requests/day shared quota |
 
-Hosted endpoint: `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+Hosted endpoint: `https://ckan-mcp-server.agid.workers.dev/mcp`
 
 > **Recommendation**: Option B is a great way to get started and try things out without any setup. Once you're familiar with what the server can do, switching to Option A (local install) gives you unlimited usage with no shared quotas.
 
@@ -79,12 +128,12 @@ All examples below work with **both** the local installation and the hosted endp
 4. Fill in the form:
    - **Name:** CKAN MCP Server
    - **Description:** Search datasets on CKAN open data portals
-   - **MCP Server URL:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **MCP Server URL:** `https://ckan-mcp-server.agid.workers.dev/mcp`
    - **Authentication:** No Auth
    - Check the confirmation box, then click **Create**
 5. In a new chat, click **+** → **More** and select **CKAN MCP Server**
 
-> For a step-by-step walkthrough with screenshots, see the [full ChatGPT guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/chatgpt/chatgpt_web.md).
+> For a step-by-step walkthrough with screenshots, by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full ChatGPT guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/chatgpt/chatgpt_web.md).
 
 ### Claude Desktop
 
@@ -94,12 +143,12 @@ All examples below work with **both** the local installation and the hosted endp
 2. Click **Add custom integration**
 3. Fill in the details:
    - **Name:** CKAN MCP Server
-   - **MCP Server URL:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **MCP Server URL:** `https://ckan-mcp-server.agid.workers.dev/mcp`
 4. Click **Add** to save
 5. Open a new chat, click **+**, select **Integrations**, and enable **CKAN MCP Server**
 6. When Claude asks to use a tool, click **Allow** (or **Always allow**)
 
-> For a detailed walkthrough with screenshots, see the [full Claude guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/claude/claude_web.md).
+> For a detailed walkthrough with screenshots, , by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full Claude guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/claude/claude_web.md).
 
 **Using the hosted endpoint (no install) — via config file:**
 
@@ -113,7 +162,7 @@ Configuration file location:
 {
   "mcpServers": {
     "ckan": {
-      "url": "https://ckan-mcp-server.andy-pr.workers.dev/mcp"
+      "url": "https://ckan-mcp-server.agid.workers.dev/mcp"
     }
   }
 }
@@ -137,7 +186,7 @@ Configuration file location:
 **Using the hosted endpoint (no install):**
 
 ```bash
-claude mcp add -s user -t http ckan https://ckan-mcp-server.andy-pr.workers.dev/mcp
+claude mcp add -s user -t http ckan https://ckan-mcp-server.agid.workers.dev/mcp
 ```
 
 **Using local installation:**
@@ -151,7 +200,7 @@ claude mcp add -s user ckan npx @aborruso/ckan-mcp-server@latest
 To add it only for a specific project, run from the project folder without the `--scope user` flag:
 
 ```bash
-claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev/mcp
+claude mcp add --transport http ckan https://ckan-mcp-server.agid.workers.dev/mcp
 ```
 
 ### Le Chat (Mistral)
@@ -160,11 +209,11 @@ claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev
 2. Click **+ Add Connector**
 3. Select the **Custom MCP Connector** tab and fill in the details:
    - **Name:** CKAN
-   - **Connector Server:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **Connector Server:** `https://ckan-mcp-server.agid.workers.dev/mcp`
 4. Click **Connect** to save
 5. Open a new chat, click **+**, then **Connectors**, and enable **CKAN**
 
-> For a step-by-step walkthrough with screenshots, see the [full Le Chat guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/mistral/mistral_web.md).
+> For a step-by-step walkthrough with screenshots, , by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full Le Chat guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/mistral/mistral_web.md).
 
 ### Perplexity Pro
 
@@ -174,18 +223,18 @@ claude mcp add --transport http ckan https://ckan-mcp-server.andy-pr.workers.dev
 2. Click **Connect external app**
 3. Fill in the details:
    - **Name:** CKAN MCP Server
-   - **MCP Server URL:** `https://ckan-mcp-server.andy-pr.workers.dev/mcp`
+   - **MCP Server URL:** `https://ckan-mcp-server.agid.workers.dev/mcp`
    - **Authorization Type:** No Authentication
    - **Connection Type:** HTTP Streamable
 4. Check the confirmation box and click **Save**
 5. In a new chat, click **+** → **Connectors & sources** and enable **ckan_mcp_server**
 
-> For a step-by-step walkthrough with screenshots, see the [full Perplexity guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/perplexity/perplexity.md).
+> For a step-by-step walkthrough with screenshots, , by taking into account the MCP URL `https://ckan-mcp-server.agid.workers.dev/mcp` instead of `https://ckan-mcp-server.andy-pr.workers.dev/mcp`, see the [full Perplexity guide](https://github.com/ondata/ckan-mcp-server/blob/main/docs/guide/perplexity/perplexity.md).
 
 ### Gemini CLI
 
 ```bash
-gemini mcp add -s user -t http ckan https://ckan-mcp-server.andy-pr.workers.dev/mcp
+gemini mcp add -s user -t http ckan https://ckan-mcp-server.agid.workers.dev/mcp
 ```
 
 Or add manually to `~/.gemini/settings.json`:
@@ -194,7 +243,7 @@ Or add manually to `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "ckan": {
-      "httpUrl": "https://ckan-mcp-server.andy-pr.workers.dev/mcp"
+      "httpUrl": "https://ckan-mcp-server.agid.workers.dev/mcp"
     }
   }
 }
@@ -210,7 +259,7 @@ Add to your User Settings or `.vscode/settings.json`:
 {
   "mcpServers": {
     "ckan": {
-      "url": "https://ckan-mcp-server.andy-pr.workers.dev/mcp",
+      "url": "https://ckan-mcp-server.agid.workers.dev/mcp",
       "type": "http"
     }
   }
@@ -238,7 +287,7 @@ Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.ckan]
-url = "https://ckan-mcp-server.andy-pr.workers.dev/mcp"
+url = "https://ckan-mcp-server.agid.workers.dev/mcp"
 ```
 
 **Using local installation:**

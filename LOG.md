@@ -709,6 +709,24 @@ Security hardening — 3 advisories, "poison and door" (environmental risk befor
 - Replace raw `error.message` interpolation in all tool catch blocks (datastore, package, organization, group, analyze, portal-discovery, quality) with `formatCkanError()`
 - Replace fragile string-match in `organization.ts` (`includes('CKAN API error (500)')`) with `error instanceof CkanApiError && error.status === 500`
 - Tests: 9 new unit tests for `CkanApiError` and `formatCkanError` → 387 total (381 pass, 6 skipped)
+## 2026-05-25 (v2)
+
+- Fix (scoring v2): `scoreDatasetRelevance` now reads `holder_name` and `publisher_name` from CKAN dataset `extras[]` first (authoritative DCAT-AP_IT source), with fallback to root-level fields for non-DCAT-AP_IT catalogs
+- Rationale: on dati.gov.it (ckanext-dcatapit), `package_search` returns DCAT-AP_IT fields in two locations that often disagree. Inside `extras[]` the values reflect the true `dct:rightsHolder` / `dct:publisher` set by the publisher; at root level the same field names are populated by the harvester with the harvesting organization's name, NOT the data owner
+- Concrete example: dataset `defibrillatori-esterni` on dati.gov.it has root `holder_name = "GAL Terra dei Messapi"` (the harvester) and `extras.holder_name = "Comune di Mesagne"` (the actual owner per DCAT-AP_IT). Without this fix, v1 of the scoring change still produced `holder = 0` on queries mentioning the real owner
+- The v1 fix (peer commit) introduced the holder/publisher fields but read them from the root level only; this commit completes the fix by sourcing them from the correct DCAT-AP_IT location
+- Added helper `readDcatExtra(dataset, key)` to encapsulate the lookup logic
+- Validated against real `package_search` payloads on `https://dati.gov.it/opendata`: Mesagne score 6→12, Lecce/Cardioprotetto score 10→13
+
+## 2026-05-25
+
+- Fix (scoring): `ckan_find_relevant_datasets` now scores `holder_name` (DCAT-AP_IT `dct:rightsHolder`) and `publisher_name` (`dct:publisher`) as distinct weighted fields, separate from `organization`
+- Rationale: on federated catalogs (e.g. `dati.gov.it`), `organization` is the harvesting catalog (e.g. `regione-puglia`), NOT the data owner. Queries like "datasets from Comune di Lecce" previously scored 0 on the owner field when the dataset was harvested via Regione Puglia or a GAL, missing the actual `rightsHolder`
+- Bug surfaced on real-world Puglia datasets: `defibrillatori-esterni` (holder: Comune di Mesagne, organization: GAL Terra dei Messapi) and `defibrillatori-dae-progetto-comune-cardioprotetto` (holder: Comune di Lecce, organization: Regione Puglia)
+- Defaults: `holder=4` (peer with `title` — actual institutional owner per DCAT-AP_IT), `publisher=2` (lower because sometimes a technical role like "Redazione OD" rather than the institution)
+- API: `weights` object accepts two new optional fields (`holder`, `publisher`); backward-compatible — clients not setting them get the improved scoring by default
+- Types: added `holder_name?: string` and `publisher_name?: string` to `CkanPackage` interface (previously accessed via index signature)
+- Score breakdown markdown and JSON outputs include `holder` and `publisher` per dataset
 
 ## 2026-04-22
 

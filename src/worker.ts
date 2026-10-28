@@ -196,7 +196,8 @@ export default {
 
     <h2>📚 Resources</h2>
     <ul>
-      <li><a href="https://github.com/ondata/ckan-mcp-server" target="_blank">GitHub Repository</a></li>
+      <li><a href="https://github.com/AgID/ckan-mcp-server" target="_blank">GitHub Repository (AgID)</a></li>
+      <li><a href="https://github.com/ondata/ckan-mcp-server" target="_blank">Progetto upstream (OnData)</a></li>
       <li><a href="https://www.npmjs.com/package/@aborruso/ckan-mcp-server" target="_blank">npm Package</a></li>
       <li><a href="https://modelcontextprotocol.io/" target="_blank">MCP Documentation</a></li>
       <li><a href="https://docs.ckan.org/en/latest/api/" target="_blank">CKAN API Reference</a></li>
@@ -206,7 +207,7 @@ export default {
     <pre><code>curl ${url.origin}/health</code></pre>
 
     <div class="footer">
-      Running on Cloudflare Workers •<a href="https://github.com/ondata/ckan-mcp-server/blob/main/LICENSE" target="_blank">MIT License</a>
+      Running on Cloudflare Workers •<a href="https://github.com/AgID/ckan-mcp-server/blob/agid-main/LICENSE" target="_blank">MIT License</a>
     </div>
   </div>
 </body>
@@ -259,6 +260,36 @@ export default {
             'Access-Control-Max-Age': '86400'
           }
         });
+      }
+
+      // CERT-AgID rec. #4 (controllo e monitoraggio): Bearer auth opzionale via env.
+      // Se CKAN_AUTH_TOKEN è settato nel Worker, ogni richiesta /mcp deve includere
+      // header 'Authorization: Bearer <token>' coincidente. Se la env non è settata
+      // (default), endpoint resta pubblico per non rompere deploy esistenti.
+      const requiredAuthToken =
+        typeof process !== 'undefined' && process.env
+          ? process.env.CKAN_AUTH_TOKEN
+          : undefined;
+      if (requiredAuthToken) {
+        const authHeader = request.headers.get('Authorization') ?? '';
+        const expected = `Bearer ${requiredAuthToken}`;
+        if (authHeader !== expected) {
+          return new Response(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32001, message: 'Unauthorized: invalid or missing Bearer token' },
+              id: null
+            }),
+            {
+              status: 401,
+              headers: {
+                'Content-Type': 'application/json',
+                'WWW-Authenticate': 'Bearer realm="ckan-mcp"',
+                'Access-Control-Allow-Origin': '*'
+              }
+            }
+          );
+        }
       }
 
       try {
@@ -347,8 +378,9 @@ export default {
         // Add CORS headers and service notices
         const headers = new Headers(response.headers);
         headers.set('Access-Control-Allow-Origin', '*');
-        headers.set('X-Service-Notice', 'Demo instance - 100k requests/day shared quota');
-        headers.set('X-Recommendation', 'https://github.com/ondata/ckan-mcp-server#installation');
+        headers.set('X-Service-Notice', 'Servizio MCP-CKAN di AgID');
+        headers.set('X-Source-Repository', 'https://github.com/AgID/ckan-mcp-server');   // il codice in esecuzione
+        headers.set('X-Upstream-Project', 'https://github.com/ondata/ckan-mcp-server');  // da cui deriva
 
         return new Response(response.body, {
           status: response.status,
