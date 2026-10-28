@@ -7,6 +7,8 @@
 import { createServer, registerAll } from "./server.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { getLastCacheHit } from "./utils/http.js";
+import { takeSearchResults } from "./utils/search-telemetry.js";
+import { summarizeToolError } from "./utils/error-telemetry.js";
 
 interface AnalyticsEngineDataset {
   writeDataPoint(event: { blobs?: string[]; doubles?: number[]; indexes?: string[] }): void;
@@ -221,7 +223,7 @@ export default {
     if (request.method === 'GET' && url.pathname === '/health') {
       return new Response(JSON.stringify({
         status: 'ok',
-        version: '0.4.127',
+        version: '0.4.133',
         tools: 20,
         resources: 7,
         prompts: 6,
@@ -335,13 +337,21 @@ export default {
         if (logEntry) {
           const cacheHit = getLastCacheHit();
           if (cacheHit !== null) logEntry['cache_hit'] = cacheHit;
+          const searchResults = takeSearchResults(server);
+          if (searchResults) Object.assign(logEntry, searchResults);
           logEntry['duration_ms'] = durationMs;
 
           let callStatus = 'ok';
           try {
             const rj = await response.clone().json() as Record<string, unknown>;
             const result = rj?.result as Record<string, unknown> | undefined;
-            if (result?.isError || rj?.error) callStatus = 'error';
+            if (result?.isError || rj?.error) {
+              callStatus = 'error';
+              const content = result?.content as { text?: unknown }[] | undefined;
+              const rpcError = rj?.error as { message?: unknown } | undefined;
+              const text = content?.[0]?.text ?? rpcError?.message;
+              if (typeof text === 'string') Object.assign(logEntry, summarizeToolError(text));
+            }
           } catch { /* ignore */ }
           logEntry['status'] = callStatus;
 

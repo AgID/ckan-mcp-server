@@ -44,6 +44,14 @@ FLAT_FIELDS = (
     "cache_hit",
     "duration_ms",
     "limit",
+    "fq",
+    "sort",
+    "result_count",
+    "result_start",
+    "result_ids",
+    "result_names",
+    "error_message",
+    "error_kind",
 )
 DAY_MS = 86400 * 1000
 
@@ -174,6 +182,10 @@ def flatten(event: dict) -> dict | None:
     ts_ms = event.get("timestamp", 0)
     ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms / 1000))
 
+    # The Observability API drops empty arrays: a search with zero results arrives
+    # with result_count 0 and no lists. Restore them, so 0 results != not a search.
+    has_results = isinstance(source, dict) and source.get("result_count") is not None
+
     return {
         "id": metadata.get("id"),
         "timestamp": ts_iso,
@@ -188,6 +200,14 @@ def flatten(event: dict) -> dict | None:
         "cache_hit": source.get("cache_hit") if isinstance(source, dict) else None,
         "duration_ms": source.get("duration_ms") if isinstance(source, dict) else None,
         "limit": source.get("limit") if isinstance(source, dict) else None,
+        "fq": source.get("fq") if isinstance(source, dict) else None,
+        "sort": source.get("sort") if isinstance(source, dict) else None,
+        "result_count": source.get("result_count") if isinstance(source, dict) else None,
+        "result_start": source.get("result_start") if isinstance(source, dict) else None,
+        "result_ids": source.get("result_ids", []) if has_results else None,
+        "result_names": source.get("result_names", []) if has_results else None,
+        "error_message": source.get("error_message") if isinstance(source, dict) else None,
+        "error_kind": source.get("error_kind") if isinstance(source, dict) else None,
     }
 
 

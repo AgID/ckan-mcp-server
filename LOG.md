@@ -1,5 +1,88 @@
 # LOG
 
+## 2026-10-28
+
+### Daily stats: invalid input counted apart
+
+`worker_daily_calls.jsonl` gains `invalid_input`: failed calls rejected before any portal was contacted, mostly scanners sending dozens of tools in one second with `server_url` `''`, `test`, `{not:a string}`. They are no longer in `errors`, which now measures failures on real portals. Rule: `error_kind` `validation`/`not_allowed` (logged since v0.4.133); older lines inferred from `server`, with `ckan_find_portals` excluded (it takes no server, its 96 failures were real). On the full history `calls` and `ok` are unchanged; since 2026-09-05 errors 754 → 333 errors + 421 invalid input; 2026-10-27: 74 → 11 + 63. Tests in `tests/python/test_worker_daily_stats.py` (fail on the old script); DuckDB is now installed before the tests in `update-telemetry.yml` so they run there.
+
+### v0.4.133
+
+Ships #568. For callers: `ckan_find_portals` works again on the hosted Worker (it failed on every call since at least 2026-09-05); `ckan_status_show` on a site that is not a CKAN API now says so and points at `ckan_find_portals`, instead of telling the caller to call `ckan_status_show`; `open.toronto.ca` works as a server URL in every tool (routed to its CKAN host). Tests 616 passed. Smoke 16/17: same MQA outage as v0.4.132 (per-dataset `/api/mqa/cache/*/{id}` still not answering, `/global` 0.2 s), tagged with `SKIP_RELEASE_GATE=1` on the user's decision. Live on npm (provenance), the MCP Registry (`isLatest`), the Worker (`/health` 0.4.133) and the GitHub release (DXT + skill). Checked on the live Worker: `ckan_find_portals` 945 portals in 4.4 s, 749 ms CPU; `open.toronto.ca` search routed (17 results). MQA outage confirmed from the browser: data.europa.eu's own quality page calls the same `/api/mqa/cache/datasets/{id}` and gets no answer either.
+
+### Telemetry errors: find_portals fixed on Workers, error messages logged, non-CKAN hints
+
+From the error analysis of `worker_events_flat.jsonl` (app errors are logged only since 2026-09-05: 754 of 3,752 calls, 537 of them invalid input from scanners).
+
+- `ckan_find_portals` failed on every Worker call (96/96 since 2026-09-05): it was the only tool calling axios directly, and axios's fetch adapter breaks on Workers ("The 'cache' field on 'RequestInitializerDict' is not implemented"). Now uses `safeFetch`, like MQA; SSRF checks on redirects come with it. Checked with `wrangler dev`: 945 portals, about 5 s (the datashades.info list is 22 MB).
+- The worker log line of a failed call now has `error_message` (first 200 chars, one line) and `error_kind` (`validation`, `not_allowed`, `timeout`, `upstream_http`, `unreachable`, `other`, `src/utils/error-telemetry.ts`); the archiver carries both into the flat file. The find_portals failure stayed hidden for weeks because the log only said `error`.
+- `ckan_status_show` on a site that is not the CKAN API (47% failure on real URLs: open.toronto.ca, open.ottawa.ca, data.europa.eu/data, ...) told the caller to call `ckan_status_show`. It now says the site may not run CKAN or keep the API on another host, and points at `ckan_find_portals`. `open.toronto.ca` is routed to its CKAN host `ckan0.cf.opendata.inter.prod-toronto.ca` via `portals.json`.
+- Tests 615 passed (+14, each new test fails without its fix), Python tests 5.
+
+## 2026-10-27
+
+### Archiver: empty result lists for zero-result searches
+
+Manual archiver run on a scratchpad copy (7 live events): search fields reach `worker_events_flat.jsonl`, but a zero-result search came in with `result_ids`/`result_names` null, since the Observability API drops empty arrays from `source`. `flatten()` now restores `[]` whenever `result_count` is present, so "0 results" stays distinct from "not a search". Rechecked on a fresh copy: `zzqxkwvnonesiste` → `result_count` 0, lists `[]`. Tests in `tests/python/test_worker_telemetry_archiver.py` (stdlib `unittest`: zero count with omitted lists, non-empty lists, non-search event, field set); the zero-count case fails on the previous `flatten()`. They run in `update-telemetry.yml` before each archiver run (Greptile review).
+
+### v0.4.132
+
+Ships #565: worker telemetry logs returned search results. Tests 601 passed. Smoke 16/17: the MQA case times out because data.europa.eu `/api/mqa/cache/datasets/{id}` (and its successor `/resources/{id}`) hang for every dataset id tried, while `/global`, `/countries`, `/catalogues/dati-gov-it` answer in 0.2 s; released anyway on the user's decision. Live on npm (provenance), the MCP Registry (`isLatest`), the Worker (`/health` 0.4.132) and the GitHub release (DXT + skill attached). Observability API checked read-only: `result_ids` arrives as a list and `flatten()` maps it. The official spec (`openapi.yaml` 6.0.1-SNAPSHOT) marks `/datasets/{id}` deprecated, alias of `/resources/{id}`: switching is a separate change.
+
+### Worker telemetry: returned search results
+
+`ckan_package_search` and `ckan_find_relevant_datasets` now record the datasets they return (ids and names in rank order, max 20), the total count (zero included) and the start offset. The worker adds them to its log line (`result_count`, `result_start`, `result_ids`, `result_names`), and the archiver carries them, plus `fq` and `sort`, into `data/worker_events_flat.jsonl`. Goal: query → result pairs for search fine-tuning. No session id exists (stateless worker): a later `package_show` on an id in `result_ids` links to the search. Side channel keyed by the per-request `McpServer` (`src/utils/search-telemetry.ts`), so concurrent requests cannot mix. Checked with `wrangler dev` on dati.gov.it, zero-result case included.
+
+## 2026-10-26
+
+### Update Worker Telemetry: DuckDB pinned to v2.0.0
+
+The workflow had failed twice a day since 2026-10-21: DuckDB v2.0.0 (released that day) renamed the CLI asset from `duckdb_cli-linux-amd64.zip` to `duckdb-cli-linux-amd64.tar.gz`, so `releases/latest/download/...zip` returned 404. Now downloads the v2.0.0 tarball explicitly (pinned, so a future rename does not break it again). Checked locally: `scripts/worker_daily_stats.sh` with v2.0.0 and v1.5.6 in UTC gives output identical to the committed `data/worker_daily_calls.jsonl`. Note: v2.0.0 reads `...Z` timestamps as `TIMESTAMPTZ`, so `::TIMESTAMP` follows the machine time zone; on the UTC runner nothing changes, on a non-UTC machine the daily counts shift.
+
+## 2026-10-22
+
+### v0.4.131
+
+Ships #563: Anubis challenge retry with an honest User-Agent (#7). Tests 595 passed, smoke 17/17. Live on npm (with provenance; the registry took ~5 min to serve it after the CI publish), the MCP Registry (`isLatest`), the Worker (`/health` 0.4.131) and the GitHub release (DXT + skill attached).
+
+### Anubis-fronted portals: retry once with an honest User-Agent (#7)
+
+Reported by @umlwbin: our Chrome-impersonating headers (needed by dati.anticorruzione.it's WAF) trip Anubis anti-bot gates, which answer with an HTML proof-of-work page that axios cannot solve. Anubis challenges any UA containing `Mozilla`, including `Mozilla/5.0 (compatible; ...)`, so no fixed UA serves both portals. `makeCkanRequest` now detects the challenge page (`anubis_challenge` marker, `isAnubisChallenge`) and retries once with `CKAN-MCP-Server/1.0` and no `Sec-CH-UA*` headers, on both the axios and fetch/Workers paths. The retry acquires its own rate-limit token (Greptile review). +6 tests (fail without the fix). Tests 595 passed; e2e `package_search` OK on canwin-datahub.ad.umanitoba.ca/data (48,947), dati.anticorruzione.it (70), dati.gov.it.
+
+## 2026-10-19
+
+### Advisory GHSA-w3gp-3hrh-v465 published
+
+Reported by @olevasseur, accepted and published as Medium (CVSS 6.5): affected `>= 0.4.114, <= 0.4.129`, patched `0.4.130`. CVE requested, not yet assigned. v0.4.130 is live on npm (with provenance), the MCP Registry and the Worker. `SECURITY.md` table updated.
+
+### v0.4.130
+
+Ships #561: linear shrink in `truncateJson` (GHSA-w3gp-3hrh-v465). Tests 589 passed, smoke 17/17.
+
+### Security: linear shrink in `truncateJson` (GHSA-w3gp-3hrh-v465)
+
+Reported by @olevasseur. `truncateJson()` popped one array element at a time and re-serialized the whole object after each pop: O(n²). A portal answering `status_show` (or any tool in `response_format: json`) with a ~3 MB, 32,000-item array blocked the event loop for ~59 s. Replaced with a binary search on the largest fitting prefix: same output (543 rows kept), 17 `JSON.stringify` calls instead of 31,459, 55 ms instead of 59 s. Regression test counts serializations. Tests 589 passed; e2e on dati.gov.it `status_show` and messina DataStore JSON (1000 records → 254 kept, valid JSON).
+
+## 2026-10-06
+
+### v0.4.129
+
+Ships #558 (by @paoValle, closes #31): error messages now tell the caller what to try next where they said nothing. A timeout, DNS failure or network error gets "Portal unreachable. Retry later, or call `ckan_status_show`" (noting its answer can be cached up to an hour), on both Node and Workers; 5xx errors point at `ckan_status_show` too; a 404 on `ckan_group_show` suggests `ckan_group_list`/`ckan_group_search`. A request refused by the SSRF guard keeps the guard's own message instead of a retry hint. Released the same day as the merge, by explicit exception to the release cadence rule. Tests 587 passed, smoke 17/17.
+
+## 2026-09-28
+
+### Advisory GHSA-279h-fmcr-4rwv published
+
+Reported by @manus-pi, accepted and published as Medium (CVSS 5.8): affected `<= 0.4.127`, patched `0.4.128`. CVE requested, not yet assigned. v0.4.128 is live on npm (with provenance), the MCP Registry and the Worker. `SECURITY.md` table updated; GHSA-x32r-mh7g-q2rf got CVE-2026-92146 in the meantime.
+
+### v0.4.128
+
+Ships #556: every redirect hop in `makeCkanRequest` is re-validated (GHSA-279h-fmcr-4rwv), on both the Node/axios and Workers/fetch paths. Smoke 17/17.
+
+### Security: validate every redirect hop in `makeCkanRequest` (GHSA-279h-fmcr-4rwv)
+
+`makeCkanRequest` followed up to 5 redirects via axios without re-validating the target. The SSRF-safe agent `lookup` is skipped by Node for IP literals, so a public URL 302-ing to `http://127.0.0.1/` or `169.254.169.254` was followed, and an internal endpoint answering `success: true` was returned in full (reproduced end-to-end via httpbin `redirect-to`). Fix: axios `beforeRedirect` calls `validateServerUrl` on each hop; the Workers `fetch` branch now uses `safeFetch` (`maxHops: 5`). Side effect: `CKAN_ALLOWED_DOMAINS` now applies to redirect targets too, so a portal redirecting to another host needs both listed. The public Worker (no allowlist) is unaffected for public portals.
+
 ## 2026-09-24
 
 ### v0.4.127

@@ -5,6 +5,7 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema, CkanTag, CkanResource, CkanPackage } from "../types.js";
 import { makeCkanRequest, formatCkanError } from "../utils/http.js";
+import { recordSearchResults } from "../utils/search-telemetry.js";
 import { truncateText, truncateJson, formatDate, formatBytes, addDemoFooter, wrapUntrusted, safeUrlText, formatError, jsonToolResult, sanitizeInline } from "../utils/formatting.js";
 import { getDatasetViewUrl, extractSourcePortal } from "../utils/url-generator.js";
 import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery, mayNeedTextWrapping, hasExplicitBooleanOperator } from "../utils/search.js";
@@ -1079,8 +1080,10 @@ Typical workflow: ckan_status_show (check locale) → ckan_package_search (query
             params.server_url,
             effectiveQuery !== params.q ? effectiveQuery : undefined
           );
+          const text = truncateJson(compact);
+          recordSearchResults(server, result.count ?? 0, effectiveStart, result.results ?? [], text);
           return {
-            content: [{ type: "text", text: truncateJson(compact) }]
+            content: [{ type: "text", text }]
           };
         }
 
@@ -1188,8 +1191,10 @@ ${hvdNote}`;
           }
         }
 
+        const text = truncateText(addDemoFooter(markdown));
+        recordSearchResults(server, result.count ?? 0, effectiveStart, result.results ?? [], text);
         return {
-          content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
+          content: [{ type: "text", text }]
         };
       } catch (error) {
         return {
@@ -1364,7 +1369,9 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
         };
 
         if (params.response_format === ResponseFormat.JSON) {
-          return jsonToolResult(payload);
+          const jsonResult = jsonToolResult(payload);
+          recordSearchResults(server, payload.total_results, 0, top, jsonResult.content[0].text);
+          return jsonResult;
         }
 
         let markdown = `# Relevant CKAN Datasets\n\n`;
@@ -1409,8 +1416,10 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
           });
         }
 
+        const text = truncateText(addDemoFooter(markdown));
+        recordSearchResults(server, payload.total_results, 0, top, text);
         return {
-          content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
+          content: [{ type: "text", text }]
         };
       } catch (error) {
         return {
